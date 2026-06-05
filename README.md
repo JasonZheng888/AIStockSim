@@ -1,4 +1,4 @@
-# AI模拟炒股及摸鱼盯盘工具
+# AIStockSim - AI模拟炒股及摸鱼盯盘工具
 
 一个面向 Windows 的轻量 AI 模拟炒股及摸鱼盯盘工具：既能像透明盯盘小窗一样贴在屏幕角落看盘，也能在主界面里用真实行情练习虚拟买卖、复盘持仓、比较自己和 AI/Codex 的模拟操作。
 
@@ -24,7 +24,7 @@
 
 ## 使用方式
 
-右侧 Releases 如果有打包好的 `StockTradingSim.exe`，可直接下载运行。项目名叫“AI模拟炒股及摸鱼盯盘工具”，可执行文件仍保留 `StockTradingSim.exe`，方便和配置目录对应。
+右侧 Releases 如果有打包好的 `StockTradingSim.exe`，可直接下载运行。项目展示名叫 `AIStockSim - AI模拟炒股及摸鱼盯盘工具`，可执行文件仍保留 `StockTradingSim.exe`，方便和配置目录对应。
 
 通过源码运行：
 
