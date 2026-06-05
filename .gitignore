@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec.bak
+*.log
+
+# Local runtime data. Real account/simulation records live in AppData,
+# but keep these names ignored if users export them into the repo folder.
+portfolio.json
+codex_orders.json
+trading_calendar.json
+compact_config.json
+SW_config.json
+
+# Local packaged binaries are better published through GitHub Releases.
+*.exe
