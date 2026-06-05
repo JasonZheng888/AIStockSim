@@ -1,3 +1,4 @@
+<img width="1848" height="894" alt="盯盘模式效果" src="https://github.com/user-attachments/assets/5027a52e-6e77-4f78-a833-4d0d97a3f550" />
 # AIStockSim - AI模拟炒股及摸鱼盯盘工具
 
 一个面向 Windows 的轻量 AI 模拟炒股及摸鱼盯盘工具：既能像透明盯盘小窗一样贴在屏幕角落看盘，也能在主界面里用真实行情练习虚拟买卖、复盘持仓、比较自己和 AI/Codex 的模拟操作。
@@ -20,7 +21,6 @@
 
 盯盘模式可以低调贴在屏幕角落，适合在不打断当前工作的情况下查看价格和涨跌幅。
 
-![盯盘模式效果](https://github.com/JasonZheng666/AIStockSim/raw/main/docs/images/watch-mode.jpg)
 
 ## 适合谁
 
