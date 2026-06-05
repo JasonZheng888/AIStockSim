@@ -20,7 +20,7 @@
 
 盯盘模式可以低调贴在屏幕角落，适合在不打断当前工作的情况下查看价格和涨跌幅。
 
-![盯盘模式效果](docs/images/watch-mode.jpg)
+![盯盘模式效果](./docs/images/watch-mode.jpg?raw=true)
 
 ## 适合谁
 
