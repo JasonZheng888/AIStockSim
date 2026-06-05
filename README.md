@@ -24,7 +24,7 @@
 
 ## 使用方式
 
-右侧 Releases 如果有打包好的 `StockTradingSim.exe`，可直接下载运行。项目展示名叫 `AIStockSim - AI模拟炒股及摸鱼盯盘工具`，可执行文件仍保留 `StockTradingSim.exe`，方便和配置目录对应。
+右侧 Releases 如果有打包好的 Windows 版 `StockTradingSim.exe`，可直接下载运行。
 
 通过源码运行：
 
