@@ -13,6 +13,7 @@
 * **持仓复盘**：区分“交易均价”和“摊余回本价”，适合复盘真实交易中历史亏损摊到剩余持仓后的回本目标。
 * **主界面 + 盯盘模式**：主界面做模拟交易，盯盘模式复用透明浮窗能力，支持拖动、右键指标开关、颜色、字体、K 线和设置面板。
 * **AI/Codex 指令接入**：OpenAI-compatible API 或 Codex 可以生成 JSON 限价委托，软件负责按交易规则撮合并留痕。
+* **单文件免安装**：Release 提供打包好的单文件 `StockTradingSim.exe`，Windows 用户下载后可直接双击运行。
 * **本机数据**：账户、持仓、委托和交易记录保存在本机 `%APPDATA%\StockTradingSim`，便于备份、迁移或清理。
 
 ## 适合谁
@@ -24,7 +25,7 @@
 
 ## 使用方式
 
-右侧 Releases 如果有打包好的 Windows 版 `StockTradingSim.exe`，可直接下载运行。
+右侧 Releases 有打包好的单文件 `StockTradingSim.exe`，Windows 用户可直接下载，双击运行。
 
 通过源码运行：
 
