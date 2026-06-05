@@ -916,7 +916,7 @@ class LegacyCompactWindow(LegacyStockWidget.FloatLabel):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle(f"StockTradingSim 模拟炒股 {APP_VERSION}")
+        self.setWindowTitle(f"AI模拟炒股及摸鱼盯盘工具 {APP_VERSION}")
         self.setMinimumSize(760, 520)
         self.store = PortfolioStore()
         self.quotes = QuoteService()
@@ -1994,7 +1994,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "缺少 API Key", "请先填写 OpenAI-compatible API Key。")
             return
         prompt = (
-            "你是模拟炒股软件中的交易助手。只输出 JSON 数组，不要输出 Markdown。"
+            "你是 AI模拟炒股及摸鱼盯盘工具中的交易助手。只输出 JSON 数组，不要输出 Markdown。"
             "每个元素格式为 {\"action\":\"buy|sell|hold\", \"code\":\"sh600000\", \"qty\":100, \"limit_price\":10.5, \"reason\":\"简短理由\"}。"
             "buy/sell 必须提供 limit_price；hold 可以省略 qty 和 limit_price。"
             "买入委托在实时价小于等于 limit_price 时成交，卖出委托在实时价大于等于 limit_price 时成交。"
