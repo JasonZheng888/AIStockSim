@@ -50,7 +50,7 @@ from PySide6.QtWidgets import (
 
 
 APP_NAME = "StockTradingSim"
-APP_VERSION = "2.0.0-dev"
+APP_VERSION = "2.0.0"
 DISPLAY_NAME = "AIStockSim - AI模拟炒股及摸鱼盯盘工具"
 CONFIG_DIR = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~"), APP_NAME)
 CONFIG_FILE = os.path.join(CONFIG_DIR, "portfolio.json")
@@ -1703,7 +1703,7 @@ class MainWindow(QMainWindow):
         tab.setWidget(content)
         controls = QHBoxLayout()
         self.code_input = QLineEdit()
-        self.code_input.setPlaceholderText("输入代码：600000 / sh688270 / hk01810")
+        self.code_input.setPlaceholderText("输入代码：600000 / sh688001 / hk01810")
         add_btn = QPushButton("加入自选")
         remove_btn = QPushButton("移除选中")
         add_btn.clicked.connect(self.add_watch)
@@ -2315,8 +2315,8 @@ class MainWindow(QMainWindow):
         self.ai_output.setPlaceholderText(
             'AI/Codex 指令 JSON 示例：\n'
             '[{"action":"buy","code":"hk01810","qty":200,"limit_price":28.0,"reason":"回调到目标价后模拟买入"},\n'
-            ' {"action":"amend","code":"sh688820","side":"sell","limit_price":166.5,"reason":"调整旧卖单"},\n'
-            ' {"action":"cancel","code":"sh688820","side":"sell","reason":"取消旧委托"}]\n\n'
+            ' {"action":"amend","code":"sh600000","side":"sell","limit_price":12.8,"reason":"调整旧卖单"},\n'
+            ' {"action":"cancel","code":"sh600000","side":"sell","reason":"取消旧委托"}]\n\n'
             f"Codex 本地指令文件：{CODEX_ORDER_FILE}"
         )
         layout.addWidget(self.ai_output, 1)
@@ -2708,7 +2708,7 @@ class MainWindow(QMainWindow):
 
     def add_watch(self) -> None:
         if not self.store.add_watch(self.code_input.text()):
-            QMessageBox.warning(self, "代码无效", "请输入 A 股或港股代码，例如 600000、sh688270、hk01810。")
+            QMessageBox.warning(self, "代码无效", "请输入 A 股或港股代码，例如 600000、sh688001、hk01810。")
             return
         self.code_input.clear()
         self.sync_compact_watchlist(show_all=True)
@@ -3916,8 +3916,8 @@ class MainWindow(QMainWindow):
             "\"actions\":\"操作建议或观察条件\","
             "\"details\":{\"evidence\":[\"依据1\",\"依据2\"],\"risks\":[\"风险1\"]}}"
             "],"
-            "\"commands\":[{\"action\":\"hold|buy|sell|cancel|amend\",\"code\":\"sh688820\",\"qty\":200,"
-            "\"limit_price\":166.5,\"reason\":\"简短理由\"}],"
+            "\"commands\":[{\"action\":\"hold|buy|sell|cancel|amend\",\"code\":\"sh600000\",\"qty\":100,"
+            "\"limit_price\":12.8,\"reason\":\"简短理由\"}],"
             "\"notes\":[\"补充说明\"]}。"
             "commands 只是候选 JSON 指令，不要为了凑数强行下单；没有把握时使用 hold。"
             "必须遵守 T+1、可用现金、冻结资金、每手数量、风控限制和只允许快照内股票代码。"
@@ -4998,9 +4998,9 @@ class MainWindow(QMainWindow):
             } if latest_report else None,
             "rules": "模拟交易；用户和 AI/Codex 下单均为限价委托，buy/sell 指令必须包含 limit_price；买入在实时价小于等于委托价时成交，卖出在实时价大于等于委托价时成交；A股/港股均按 T+1，今日买入不可卖出；买入数量按市场每手/最低申报规则校验；暂不计算手续费、印花税、汇率。",
             "codex_order_schema": {
-                "new_order": {"action": "buy|sell", "code": "sh688820", "qty": 200, "limit_price": 166.5, "reason": "short reason"},
-                "cancel_order": {"action": "cancel", "order_id": "preferred when available", "code": "sh688820", "side": "sell", "reason": "short reason"},
-                "amend_order": {"action": "amend", "order_id": "preferred when available", "code": "sh688820", "side": "sell", "qty": 500, "limit_price": 166.5, "reason": "short reason"},
+                "new_order": {"action": "buy|sell", "code": "sh600000", "qty": 100, "limit_price": 12.8, "reason": "short reason"},
+                "cancel_order": {"action": "cancel", "order_id": "preferred when available", "code": "sh600000", "side": "sell", "reason": "short reason"},
+                "amend_order": {"action": "amend", "order_id": "preferred when available", "code": "sh600000", "side": "sell", "qty": 100, "limit_price": 12.8, "reason": "short reason"},
                 "matching": "Use order_id when possible. Without order_id, code + side must match exactly one active pending order.",
             },
         }

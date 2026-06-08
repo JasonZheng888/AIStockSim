@@ -1,9 +1,9 @@
 
 # AIStockSim - AI模拟炒股及摸鱼盯盘工具
 
-当前开发版本：`2.0.0-dev`
+当前版本：`2.0.0`
 
-> `2.0.0-dev` 正在重构交互和界面，目标是把 AIStockSim 从表格型模拟盘升级为 AI 模拟交易工作台。稳定版可使用 Release 中的 `1.1.0`。
+> `2.0.0` 把 AIStockSim 从表格型模拟盘升级为 AI 模拟交易工作台，保留单文件 exe、A 股/港股行情、模拟交易和盯盘模式。
 
 一个面向 Windows 的轻量 AI 模拟炒股及摸鱼盯盘工具：既能像透明盯盘小窗一样贴在屏幕角落看盘，也能在主界面里用真实行情练习虚拟买卖、复盘持仓、比较自己和 AI/Codex 的模拟操作。
 
@@ -93,9 +93,9 @@ Codex 本地指令文件：
   },
   {
     "action": "sell",
-    "code": "sh688270",
+    "code": "sh600000",
     "qty": 100,
-    "limit_price": 95.5,
+    "limit_price": 12.5,
     "reason": "反弹到目标价后模拟卖出"
   }
 ]
@@ -109,15 +109,15 @@ Codex 本地指令文件：
 [
   {
     "action": "amend",
-    "code": "sh688820",
+    "code": "sh600000",
     "side": "sell",
-    "qty": 500,
-    "limit_price": 166.5,
+    "qty": 100,
+    "limit_price": 12.8,
     "reason": "调整未成交卖单价格"
   },
   {
     "action": "cancel",
-    "code": "sh688820",
+    "code": "sh600000",
     "side": "sell",
     "reason": "取消旧委托"
   }
