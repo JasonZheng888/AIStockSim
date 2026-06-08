@@ -13,7 +13,7 @@ import requests
 import StockWidget as LegacyStockWidget
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtCore import QSize
-from PySide6.QtGui import QAction, QColor, QIcon
+from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -505,6 +506,69 @@ class QuoteService:
             return float(value)
         except Exception:
             return 0.0
+
+
+class EquityCurveWidget(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.points: list[tuple[str, float, float]] = []
+        self.setMinimumHeight(150)
+
+    def set_curve(self, rows: list[dict[str, Any]]) -> None:
+        self.points = []
+        for item in rows[-80:]:
+            try:
+                equity = float(item.get("equity") or 0)
+                gain = float(item.get("gain") or 0)
+            except Exception:
+                continue
+            if equity > 0:
+                self.points.append((str(item.get("time") or ""), equity, gain))
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = self.rect().adjusted(12, 10, -12, -12)
+        painter.setPen(QPen(QColor("#d8dde6"), 1))
+        painter.drawRect(rect)
+        if len(self.points) < 2:
+            painter.setPen(QColor("#7a8492"))
+            painter.drawText(rect, Qt.AlignCenter, "暂无足够账户曲线数据")
+            return
+
+        values = [point[1] for point in self.points]
+        lo = min(values)
+        hi = max(values)
+        span = hi - lo if hi > lo else max(1.0, hi * 0.01)
+        left = rect.left() + 12
+        right = rect.right() - 12
+        top = rect.top() + 16
+        bottom = rect.bottom() - 24
+        width = max(1, right - left)
+        height = max(1, bottom - top)
+
+        painter.setPen(QPen(QColor("#edf0f4"), 1))
+        for idx in range(1, 4):
+            y = top + height * idx / 4
+            painter.drawLine(left, int(y), right, int(y))
+
+        path_points: list[tuple[int, int]] = []
+        for index, (_stamp, equity, _gain) in enumerate(self.points):
+            x = left + int(width * index / max(1, len(self.points) - 1))
+            y = bottom - int((equity - lo) / span * height)
+            path_points.append((x, y))
+
+        painter.setPen(QPen(QColor("#2f80ed"), 2))
+        for start, end in zip(path_points, path_points[1:]):
+            painter.drawLine(start[0], start[1], end[0], end[1])
+
+        latest = self.points[-1]
+        painter.setPen(QColor("#303946"))
+        painter.drawText(rect.adjusted(10, 4, -10, 0), Qt.AlignTop | Qt.AlignLeft, f"最新总资产 {money(latest[1])}")
+        painter.setPen(QColor("#d21f1f") if latest[2] > 0 else QColor("#14934a") if latest[2] < 0 else QColor("#596273"))
+        painter.drawText(rect.adjusted(10, 4, -10, 0), Qt.AlignTop | Qt.AlignRight, f"累计收益 {money(latest[2])}")
 
 
 class PortfolioStore:
@@ -1443,6 +1507,25 @@ class MainWindow(QMainWindow):
         self.page_title.setText(meta["label"])
         self.page_hint.setText(meta["hint"])
 
+    def _metric_card(self, title: str) -> tuple[QFrame, QLabel, QLabel]:
+        card = QFrame()
+        card.setObjectName("MetricCard")
+        card.setFrameShape(QFrame.NoFrame)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(4)
+        title_label = QLabel(title)
+        title_label.setObjectName("MetricTitle")
+        value_label = QLabel("-")
+        value_label.setObjectName("MetricValue")
+        hint_label = QLabel("")
+        hint_label.setObjectName("MetricHint")
+        hint_label.setWordWrap(True)
+        layout.addWidget(title_label)
+        layout.addWidget(value_label)
+        layout.addWidget(hint_label)
+        return card, value_label, hint_label
+
     def _overview_tab(self) -> QWidget:
         tab = QScrollArea()
         tab.setWidgetResizable(True)
@@ -1450,28 +1533,36 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(content)
         tab.setWidget(content)
 
-        top = QGridLayout()
-        account_box = QGroupBox("账户概览")
-        account_layout = QFormLayout(account_box)
-        self.overview_equity = QLabel("-")
-        self.overview_cash = QLabel("-")
-        self.overview_gain = QLabel("-")
-        self.overview_orders = QLabel("-")
-        account_layout.addRow("总资产", self.overview_equity)
-        account_layout.addRow("可用资金", self.overview_cash)
-        account_layout.addRow("累计收益", self.overview_gain)
-        account_layout.addRow("活动委托", self.overview_orders)
+        metrics = QGridLayout()
+        metric_defs = [
+            ("equity", "总资产"),
+            ("cash", "可用资金"),
+            ("gain", "累计收益"),
+            ("orders", "活动委托"),
+            ("risk", "风险状态"),
+            ("agent", "AI 最新结论"),
+        ]
+        self.overview_metric_hints: dict[str, QLabel] = {}
+        for index, (key, title) in enumerate(metric_defs):
+            card, value, hint = self._metric_card(title)
+            setattr(self, f"overview_{key}", value)
+            self.overview_metric_hints[key] = hint
+            metrics.addWidget(card, index // 3, index % 3)
+        for column in range(3):
+            metrics.setColumnStretch(column, 1)
+        layout.addLayout(metrics)
 
-        risk_box = QGroupBox("风险与 AI")
-        risk_layout = QFormLayout(risk_box)
-        self.overview_risk = QLabel("-")
-        self.overview_agent = QLabel("-")
-        self.overview_agent.setWordWrap(True)
+        insight_row = QGridLayout()
+        ai_box = QGroupBox("AI 决策摘要")
+        ai_layout = QVBoxLayout(ai_box)
         self.overview_signal = QLabel("-")
         self.overview_signal.setWordWrap(True)
-        risk_layout.addRow("风险状态", self.overview_risk)
-        risk_layout.addRow("多智能体", self.overview_agent)
-        risk_layout.addRow("策略信号", self.overview_signal)
+        self.overview_agent_detail = QLabel("-")
+        self.overview_agent_detail.setWordWrap(True)
+        ai_layout.addWidget(QLabel("策略信号"))
+        ai_layout.addWidget(self.overview_signal)
+        ai_layout.addWidget(QLabel("多智能体摘要"))
+        ai_layout.addWidget(self.overview_agent_detail)
 
         actions_box = QGroupBox("快捷操作")
         actions_layout = QVBoxLayout(actions_box)
@@ -1486,13 +1577,49 @@ class MainWindow(QMainWindow):
         actions_layout.addWidget(compact)
         actions_layout.addStretch(1)
 
-        top.addWidget(account_box, 0, 0)
-        top.addWidget(risk_box, 0, 1)
-        top.addWidget(actions_box, 0, 2)
-        top.setColumnStretch(0, 1)
-        top.setColumnStretch(1, 2)
-        top.setColumnStretch(2, 1)
-        layout.addLayout(top)
+        curve_box = QGroupBox("账户曲线")
+        curve_layout = QVBoxLayout(curve_box)
+        self.overview_curve_hint = QLabel("")
+        self.overview_curve_hint.setObjectName("MetricHint")
+        self.overview_curve = EquityCurveWidget()
+        curve_layout.addWidget(self.overview_curve_hint)
+        curve_layout.addWidget(self.overview_curve)
+
+        insight_row.addWidget(ai_box, 0, 0)
+        insight_row.addWidget(actions_box, 0, 1)
+        insight_row.addWidget(curve_box, 0, 2)
+        insight_row.setColumnStretch(0, 2)
+        insight_row.setColumnStretch(1, 1)
+        insight_row.setColumnStretch(2, 2)
+        layout.addLayout(insight_row)
+
+        audit_box = QGroupBox("风险审计")
+        audit_layout = QVBoxLayout(audit_box)
+        self.overview_risk_table = QTableWidget(0, 4)
+        self.overview_risk_table.setHorizontalHeaderLabels(["项目", "状态", "说明", "级别"])
+        self.overview_risk_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.overview_risk_table.horizontalHeader().setStretchLastSection(True)
+        self.overview_risk_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.overview_risk_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.overview_risk_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.overview_risk_table.verticalHeader().setDefaultSectionSize(32)
+        self.overview_risk_table.setMinimumHeight(32 * 5 + self.overview_risk_table.horizontalHeader().height() + 18)
+        audit_layout.addWidget(self.overview_risk_table)
+        layout.addWidget(audit_box)
+
+        decision_box = QGroupBox("AI 决策链")
+        decision_layout = QVBoxLayout(decision_box)
+        self.overview_decision_table = QTableWidget(0, 4)
+        self.overview_decision_table.setHorizontalHeaderLabels(["环节", "立场", "结论", "证据/下一步"])
+        self.overview_decision_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.overview_decision_table.horizontalHeader().setStretchLastSection(True)
+        self.overview_decision_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.overview_decision_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.overview_decision_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.overview_decision_table.verticalHeader().setDefaultSectionSize(32)
+        self.overview_decision_table.setMinimumHeight(32 * 5 + self.overview_decision_table.horizontalHeader().height() + 18)
+        decision_layout.addWidget(self.overview_decision_table)
+        layout.addWidget(decision_box)
 
         watch_box = QGroupBox("自选股策略雷达")
         watch_layout = QVBoxLayout(watch_box)
@@ -1745,6 +1872,8 @@ class MainWindow(QMainWindow):
 
         curve_box = QGroupBox("账户曲线")
         curve_layout = QVBoxLayout(curve_box)
+        self.review_curve_widget = EquityCurveWidget()
+        curve_layout.addWidget(self.review_curve_widget)
         self.review_curve_table = QTableWidget(0, 8)
         self.review_curve_table.setHorizontalHeaderLabels(
             ["时间", "总资产", "可用资金", "持仓市值", "累计收益", "收益率", "回撤", "活动委托"]
@@ -2136,6 +2265,10 @@ class MainWindow(QMainWindow):
             #PageTitle { font-size: 20px; font-weight: 700; color: #17202a; }
             #PageHint { color: #697386; font-size: 13px; }
             #SectionTitle { font-size: 16px; font-weight: 700; color: #17202a; margin-top: 8px; }
+            #MetricCard { background: #ffffff; border: 1px solid #d6dae0; border-radius: 6px; }
+            #MetricTitle { color: #6b7280; font-size: 12px; }
+            #MetricValue { color: #17202a; font-size: 19px; font-weight: 700; }
+            #MetricHint { color: #697386; font-size: 12px; }
             QGroupBox { font-weight: 600; border: 1px solid #d6dae0; border-radius: 6px; margin-top: 12px; padding: 10px; background: #ffffff; }
             QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
             QTableWidget { background: #ffffff; border: 1px solid #d6dae0; gridline-color: #edf0f3; }
@@ -2881,6 +3014,134 @@ class MainWindow(QMainWindow):
             },
         }
 
+    def risk_audit_rows(self) -> list[dict[str, Any]]:
+        summary = self.account_summary()
+        positions = self.store.positions()
+        active_orders = self.store.active_pending_orders()
+        rows: list[dict[str, Any]] = []
+
+        def add(item: str, status: str, detail: str, sign: float = 0.0) -> None:
+            rows.append({"item": item, "status": status, "detail": detail, "sign": sign})
+
+        cn_time = trading_time_error("sh000001")
+        hk_time = trading_time_error("hk01810")
+        if cn_time is None and hk_time is None:
+            add("交易时段", "A/HK 均可交易", "模拟委托可按当前限价撮合。", 1.0)
+        elif cn_time is None:
+            add("交易时段", "A 股可交易", hk_time or "港股状态未知", 0.5)
+        elif hk_time is None:
+            add("交易时段", "港股可交易", cn_time or "A 股状态未知", 0.0)
+        else:
+            add("交易时段", "非交易时段", cn_time, -0.5)
+
+        reserved = float(summary.get("reserved") or 0)
+        available_cash = float(summary.get("available_cash") or 0)
+        equity = float(summary.get("equity") or 0)
+        if reserved > 0:
+            add("现金/冻结", "有冻结资金", f"可用 {money(available_cash)}，买入委托冻结 {money(reserved)}。", -0.2)
+        elif equity and available_cash / equity < 0.05:
+            add("现金/冻结", "现金偏低", f"可用资金 {money(available_cash)}，低于总资产 5%。", -0.3)
+        else:
+            add("现金/冻结", "充足", f"可用资金 {money(available_cash)}。", 0.8)
+
+        max_weight = 0.0
+        max_code = ""
+        for code, item in positions.items():
+            quote = self.quote_cache.get(code)
+            price = quote.price if quote else float(item.get("breakeven_cost") or item.get("avg_cost") or 0)
+            qty = int(item.get("qty") or 0)
+            weight = price * qty / equity * 100 if equity else 0.0
+            if weight > max_weight:
+                max_weight = weight
+                max_code = code
+        max_position = float(self.store.risk_config().get("max_position_pct", 65.0))
+        if max_weight >= max_position:
+            add("持仓集中度", "超出上限", f"{max_code} 仓位约 {max_weight:.1f}%，上限 {max_position:.1f}%。", -1.0)
+        elif max_weight >= max_position * 0.8:
+            add("持仓集中度", "接近上限", f"{max_code} 仓位约 {max_weight:.1f}%。", -0.5)
+        else:
+            add("持仓集中度", "可控", f"最高单票仓位 {max_weight:.1f}%。", 0.5)
+
+        qty_total = sum(int(item.get("qty") or 0) for item in positions.values())
+        sellable_total = sum(int(item.get("available") or 0) for item in positions.values())
+        if qty_total and sellable_total < qty_total:
+            add("T+1 可卖", "部分不可卖", f"持仓 {qty_total} 股，可卖 {sellable_total} 股。", -0.2)
+        elif qty_total:
+            add("T+1 可卖", "全部可卖", f"持仓 {qty_total} 股均为历史仓。", 0.6)
+        else:
+            add("T+1 可卖", "无持仓", "当前没有需要执行 T+1 检查的持仓。", 0.0)
+
+        if active_orders:
+            add("活动委托", "待撮合", f"当前有 {len(active_orders)} 条未成交委托。", -0.2)
+        else:
+            add("活动委托", "无", "没有未成交委托占用资金或仓位。", 0.5)
+
+        cfg = self.store.risk_config()
+        st_status = "开启" if cfg.get("block_st_buy", True) else "关闭"
+        add("ST 买入限制", st_status, "开启时，ST 股票买入会被风控拦截。" if st_status == "开启" else "关闭后需自行承担 ST 风险。", 0.5 if st_status == "开启" else -0.8)
+
+        ai = self.store.data.get("ai") or {}
+        if ai.get("api_key"):
+            add("AI 接入", "已配置", f"模型 {ai.get('model') or '未设置'}，候选指令仍需预审和确认。", 0.6)
+        else:
+            add("AI 接入", "未配置", "未填写 API Key 时不会调用外部 AI，只能使用本地策略上下文。", 0.0)
+        return rows
+
+    def decision_chain_rows(self) -> list[dict[str, Any]]:
+        report = self.store.latest_agent_report() or {}
+        rows: list[dict[str, Any]] = []
+        agents = report.get("agents") if isinstance(report.get("agents"), list) else []
+        if agents:
+            for agent in agents:
+                if not isinstance(agent, dict):
+                    continue
+                rows.append(
+                    {
+                        "stage": str(agent.get("role") or "AI 代理"),
+                        "stance": str(agent.get("stance") or "中性"),
+                        "summary": str(agent.get("summary") or ""),
+                        "evidence": str(agent.get("focus") or agent.get("risk") or ""),
+                        "sign": 0.0,
+                    }
+                )
+        else:
+            for agent in self.store.ai_pipeline_config().get("agents", [])[:5]:
+                if not agent.get("enabled", True):
+                    continue
+                rows.append(
+                    {
+                        "stage": str(agent.get("role") or "AI 代理"),
+                        "stance": "等待",
+                        "summary": "尚未生成 AI 分析",
+                        "evidence": str(agent.get("outputs") or ""),
+                        "sign": 0.0,
+                    }
+                )
+
+        commands = report.get("commands") if isinstance(report.get("commands"), list) else []
+        actionable = [item for item in commands if isinstance(item, dict) and str(item.get("action") or "hold").lower() != "hold"]
+        if actionable:
+            rows.append(
+                {
+                    "stage": "候选指令",
+                    "stance": f"{len(actionable)} 条待审",
+                    "summary": "AI 已给出可人工审批的候选操作。",
+                    "evidence": "在 AI 工作台查看预审结果后再执行。",
+                    "sign": 0.2,
+                }
+            )
+        elif report:
+            rows.append(
+                {
+                    "stage": "候选指令",
+                    "stance": "观望",
+                    "summary": "本轮 AI 未给出买卖候选。",
+                    "evidence": str(report.get("summary") or ""),
+                    "sign": 0.0,
+                }
+            )
+        return rows[:8]
+
     def render_account(self) -> None:
         summary = self.account_summary()
         self.record_account_snapshot(summary)
@@ -2904,16 +3165,30 @@ class MainWindow(QMainWindow):
         positions = self.store.positions()
         active_orders = self.store.active_pending_orders()
         risk_text, risk_sign = self.overview_risk_summary(positions, summary)
+
+        def metric_hint(key: str, text: str) -> None:
+            hint = getattr(self, "overview_metric_hints", {}).get(key)
+            if hint:
+                hint.setText(text)
+
         self.overview_equity.setText(money(summary["equity"]))
-        self.overview_cash.setText(f"{money(summary['available_cash'])} / 冻结 {money(summary['reserved'])}")
+        metric_hint("equity", f"持仓市值 {money(summary['market_value'])}")
+        self.overview_cash.setText(money(summary["available_cash"]))
+        metric_hint("cash", f"现金余额 {money(summary['cash'])}，冻结 {money(summary['reserved'])}")
         self.overview_gain.setText(f"{money(summary['gain'])} / {pct(summary['gain_pct'])}")
         self.overview_gain.setStyleSheet("color: #d21f1f;" if summary["gain"] > 0 else "color: #14934a;" if summary["gain"] < 0 else "")
+        metric_hint("gain", f"初始资金 {money(summary['initial'])}")
         self.overview_orders.setText(f"{len(active_orders)} 条")
+        metric_hint("orders", "未成交委托会占用现金或可卖数量")
         self.overview_risk.setText(risk_text)
         self.overview_risk.setStyleSheet("color: #14934a;" if risk_sign >= 0 else "color: #d21f1f;")
+        metric_hint("risk", "来自持仓、委托和风控配置")
 
         report = self.store.latest_agent_report()
-        self.overview_agent.setText(str((report or {}).get("summary") or "尚未生成 AI 多智能体分析"))
+        report_summary = str((report or {}).get("summary") or "尚未生成 AI 多智能体分析")
+        self.overview_agent.setText("已生成" if report else "未生成")
+        metric_hint("agent", str((report or {}).get("time") or "需要先配置 API 并生成分析"))
+        self.overview_agent_detail.setText(report_summary)
 
         codes = self.store.watchlist
         hot = []
@@ -2931,6 +3206,49 @@ class MainWindow(QMainWindow):
         if cold:
             signal_bits.append("偏弱：" + "、".join(cold[:4]))
         self.overview_signal.setText("；".join(signal_bits) if signal_bits else "暂无明显策略信号")
+
+        curve_rows = self.account_curve_rows()
+        if hasattr(self, "overview_curve"):
+            self.overview_curve.set_curve(curve_rows)
+        latest_drawdown = float(curve_rows[-1].get("drawdown_pct") or 0) if curve_rows else 0.0
+        max_drawdown = min((float(row.get("drawdown_pct") or 0) for row in curve_rows), default=0.0)
+        if hasattr(self, "overview_curve_hint"):
+            self.overview_curve_hint.setText(f"当前回撤 {pct(latest_drawdown)}，最大回撤 {pct(max_drawdown)}，样本 {len(curve_rows)} 条")
+
+        risk_rows = self.risk_audit_rows()
+        if hasattr(self, "overview_risk_table"):
+            self.overview_risk_table.setRowCount(len(risk_rows))
+            for row, item in enumerate(risk_rows):
+                sign = float(item.get("sign") or 0)
+                level = "通过" if sign > 0 else "提醒" if sign < 0 else "观察"
+                values = [
+                    str(item.get("item") or ""),
+                    str(item.get("status") or ""),
+                    str(item.get("detail") or ""),
+                    level,
+                ]
+                self._set_row(self.overview_risk_table, row, values, sign)
+                for col in (2,):
+                    cell = self.overview_risk_table.item(row, col)
+                    if cell:
+                        cell.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
+        decision_rows = self.decision_chain_rows()
+        if hasattr(self, "overview_decision_table"):
+            self.overview_decision_table.setRowCount(len(decision_rows))
+            for row, item in enumerate(decision_rows):
+                sign = float(item.get("sign") or 0)
+                values = [
+                    str(item.get("stage") or ""),
+                    str(item.get("stance") or ""),
+                    str(item.get("summary") or ""),
+                    str(item.get("evidence") or ""),
+                ]
+                self._set_row(self.overview_decision_table, row, values, sign)
+                for col in (2, 3):
+                    cell = self.overview_decision_table.item(row, col)
+                    if cell:
+                        cell.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
         self.overview_watch_table.setRowCount(len(codes))
         for row, code in enumerate(codes):
@@ -3153,6 +3471,8 @@ class MainWindow(QMainWindow):
         latest_drawdown = float(curve_rows[-1].get("drawdown_pct") or 0) if curve_rows else 0.0
         max_drawdown = min((float(row.get("drawdown_pct") or 0) for row in curve_rows), default=0.0)
         active_days = len({str(row.get("date") or "") for row in curve_rows if row.get("date")})
+        if hasattr(self, "review_curve_widget"):
+            self.review_curve_widget.set_curve(curve_rows)
         self.review_summary_label.setText(
             f"总资产 {money(summary['equity'])}，累计收益 {money(summary['gain'])} / {pct(summary['gain_pct'])}，"
             f"当前回撤 {pct(latest_drawdown)}，最大回撤 {pct(max_drawdown)}，记录 {active_days} 个交易日"
