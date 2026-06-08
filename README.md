@@ -1,6 +1,8 @@
 
 # AIStockSim - AI模拟炒股及摸鱼盯盘工具
 
+当前版本：`1.0.2`
+
 一个面向 Windows 的轻量 AI 模拟炒股及摸鱼盯盘工具：既能像透明盯盘小窗一样贴在屏幕角落看盘，也能在主界面里用真实行情练习虚拟买卖、复盘持仓、比较自己和 AI/Codex 的模拟操作。
 
 适合需要 A 股/港股模拟交易、轻量复盘和低调盯盘的个人用户。项目不连接真实证券账户，只做本地模拟和行情展示；觉得有用的话，欢迎点 Star 支持。
@@ -84,7 +86,30 @@ Codex 本地指令文件：
 ]
 ```
 
-`action` 支持 `buy`、`sell`、`hold`。`hold` 不执行交易。`buy` 和 `sell` 必须提供 `limit_price`。
+`action` 支持 `buy`、`sell`、`hold`、`cancel`、`amend`。`hold` 不执行交易。`buy` 和 `sell` 必须提供 `limit_price`。
+
+撤单和改价示例：
+
+```json
+[
+  {
+    "action": "amend",
+    "code": "sh688820",
+    "side": "sell",
+    "qty": 500,
+    "limit_price": 166.5,
+    "reason": "调整未成交卖单价格"
+  },
+  {
+    "action": "cancel",
+    "code": "sh688820",
+    "side": "sell",
+    "reason": "取消旧委托"
+  }
+]
+```
+
+如果同一代码、同一方向存在多条活动委托，请使用 `order_id` 精确匹配，避免误撤或误改。
 
 ## 当前规则边界
 

@@ -47,7 +47,7 @@ from PySide6.QtWidgets import (
 
 
 APP_NAME = "StockTradingSim"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.2"
 DISPLAY_NAME = "AIStockSim - AI模拟炒股及摸鱼盯盘工具"
 CONFIG_DIR = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~"), APP_NAME)
 CONFIG_FILE = os.path.join(CONFIG_DIR, "portfolio.json")
@@ -182,6 +182,15 @@ def normalize_code(raw: str) -> str | None:
         if s.startswith(("4", "8")):
             return "bj" + s
     return None
+
+
+def normalize_order_side(raw: Any) -> str:
+    s = str(raw or "").strip().lower()
+    if s in ("buy", "b"):
+        return "BUY"
+    if s in ("sell", "s"):
+        return "SELL"
+    return ""
 
 
 def market_name(code: str) -> str:
@@ -545,6 +554,80 @@ class PortfolioStore:
     def active_pending_orders(self) -> list[dict[str, Any]]:
         return [o for o in self.data.get("pending_orders") or [] if o.get("status") == "ACTIVE"]
 
+    def resolve_active_pending_order(self, order_id: str = "", code: str = "", action: str = "") -> tuple[dict[str, Any] | None, str | None]:
+        order_id = str(order_id or "").strip()
+        code = normalize_code(str(code or "")) or ""
+        action = str(action or "").strip().upper()
+        matches = self.active_pending_orders()
+        if order_id:
+            matches = [order for order in matches if str(order.get("id") or "") == order_id]
+        if code:
+            matches = [order for order in matches if str(order.get("code") or "") == code]
+        if action:
+            matches = [order for order in matches if str(order.get("action") or "").upper() == action]
+        if not matches:
+            return None, "No matching active pending order."
+        if len(matches) > 1:
+            return None, "Multiple active pending orders matched; please provide order_id."
+        return matches[0], None
+
+    def cancel_matching_pending_order(self, order_id: str = "", code: str = "", action: str = "", reason: str = "") -> dict[str, Any]:
+        order, error = self.resolve_active_pending_order(order_id, code, action)
+        if error or order is None:
+            raise ValueError(error or "No matching active pending order.")
+        order["status"] = "CANCELLED"
+        order["cancelled_at"] = now_str()
+        if reason:
+            order["cancel_reason"] = reason
+        self.save()
+        return order
+
+    def update_pending_order(
+        self,
+        order_id: str = "",
+        code: str = "",
+        action: str = "",
+        qty: int | None = None,
+        limit_price: float | None = None,
+        quote: Quote | None = None,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        order, error = self.resolve_active_pending_order(order_id, code, action)
+        if error or order is None:
+            raise ValueError(error or "No matching active pending order.")
+        action_name = str(order.get("action") or "").upper()
+        target_code = str(order.get("code") or "")
+        new_qty = int(qty if qty is not None else int(order.get("qty") or 0))
+        new_limit_price = float(limit_price if limit_price is not None else float(order.get("limit_price") or 0))
+        if new_qty <= 0 or new_limit_price <= 0:
+            raise ValueError("Updated qty and limit_price must be greater than 0.")
+        if action_name == "BUY":
+            self.validate_buy_quantity(target_code, new_qty)
+            current_reserved = float(order.get("limit_price") or 0) * int(order.get("qty") or 0)
+            available = round(self.cash - self.reserved_cash() + current_reserved, 2)
+            required = round(new_limit_price * new_qty, 2)
+            if required > available + 1e-6:
+                raise ValueError(f"Available cash is not enough for updated buy order; required {required:.2f}, available {available:.2f}.")
+        elif action_name == "SELL":
+            self.validate_trade_quantity(target_code, new_qty)
+            current_reserved = int(order.get("qty") or 0)
+            available_qty = self.available_sell_qty(target_code) + current_reserved
+            if new_qty > available_qty:
+                raise ValueError(f"Sell quantity is not enough for updated order; available {available_qty}.")
+        else:
+            raise ValueError("Unsupported pending order action.")
+        order["qty"] = new_qty
+        order["limit_price"] = round(new_limit_price, 4)
+        if quote:
+            order["last_price"] = round(float(quote.price), 4)
+            order["name"] = quote.name
+            order["currency"] = quote.currency
+        order["updated_at"] = now_str()
+        if reason:
+            order["update_reason"] = reason
+        self.save()
+        return order
+
     def cancel_pending_order(self, order_id: str) -> bool:
         for order in self.data.get("pending_orders") or []:
             if order.get("id") == order_id and order.get("status") == "ACTIVE":
@@ -635,6 +718,11 @@ class PortfolioStore:
 
     def positions(self) -> dict[str, dict[str, Any]]:
         pos: dict[str, dict[str, Any]] = {}
+        realized_by_code: dict[str, float] = {}
+        for trade in self.data.get("trades") or []:
+            if trade.get("action") == "SELL":
+                code = str(trade.get("code") or "")
+                realized_by_code[code] = realized_by_code.get(code, 0.0) + float(trade.get("profit") or 0)
         for lot in self.data.get("lots", []):
             code = lot.get("code")
             qty = int(lot.get("qty") or 0)
@@ -664,10 +752,18 @@ class PortfolioStore:
             if str(lot.get("buy_date", today_str())) < today_str():
                 item["available"] += qty
         for item in pos.values():
-            item["avg_cost"] = item["cost_amount"] / item["qty"] if item["qty"] else 0.0
-            item["breakeven_cost"] = item["avg_cost"]
+            qty = int(item["qty"])
+            base_cost_amount = float(item["cost_amount"])
+            realized = realized_by_code.get(str(item["code"]), 0.0)
+            breakeven_cost_amount = base_cost_amount - realized
+            item["base_cost_amount"] = base_cost_amount
+            item["realized_profit"] = realized
+            item["breakeven_cost_amount"] = breakeven_cost_amount
+            item["avg_cost"] = base_cost_amount / qty if qty else 0.0
+            item["breakeven_cost"] = breakeven_cost_amount / qty if qty else 0.0
+            item["cost_amount"] = breakeven_cost_amount
             if item.get("actual_cost_complete"):
-                item["actual_avg_cost"] = item["actual_cost_amount"] / item["qty"] if item["qty"] else 0.0
+                item["actual_avg_cost"] = item["actual_cost_amount"] / qty if qty else 0.0
             else:
                 item["actual_avg_cost"] = None
         return pos
@@ -1100,16 +1196,24 @@ class MainWindow(QMainWindow):
         self.position_table.setHorizontalHeaderLabels(
             ["代码", "名称", "持仓", "可卖", "交易均价", "回本价", "现价", "市值", "回本盈亏", "回本率"]
         )
-        self.position_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.position_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.position_table.horizontalHeader().setStretchLastSection(False)
         self.position_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.position_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.position_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.position_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.position_table.verticalHeader().setDefaultSectionSize(34)
+        self.position_table.setMinimumHeight(34 * 5 + self.position_table.horizontalHeader().height() + 18)
         self.position_table.itemSelectionChanged.connect(self.update_position_order_rule)
         layout.addWidget(self.position_table)
         return tab
 
     def _position_analysis_tab(self) -> QWidget:
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
+        tab = QScrollArea()
+        tab.setWidgetResizable(True)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        tab.setWidget(content)
         self.position_summary_label = QLabel("")
         self.position_summary_label.setStyleSheet("font-size: 13px; color: #555;")
         layout.addWidget(self.position_summary_label)
@@ -1120,10 +1224,18 @@ class MainWindow(QMainWindow):
         self.position_analysis_table.setHorizontalHeaderLabels(
             ["代码", "名称", "持仓天数", "持仓", "交易均价", "回本价", "现价", "回本盈亏", "已实现", "总收益", "回本率", "买入次数", "卖出次数"]
         )
-        self.position_analysis_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.position_analysis_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.position_analysis_table.horizontalHeader().setStretchLastSection(False)
         self.position_analysis_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.position_analysis_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.position_analysis_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.position_analysis_table.verticalHeader().setDefaultSectionSize(34)
+        analysis_table_height = 34 * 5 + self.position_analysis_table.horizontalHeader().height() + 18
+        self.position_analysis_table.setMinimumHeight(analysis_table_height)
         analysis_layout.addWidget(self.position_analysis_table)
-        layout.addWidget(analysis_box, 1)
+        analysis_margins = analysis_layout.contentsMargins()
+        analysis_box.setMinimumHeight(analysis_table_height + analysis_margins.top() + analysis_margins.bottom() + 28)
+        layout.addWidget(analysis_box)
 
         history_box = QGroupBox("每日持仓快照")
         history_layout = QVBoxLayout(history_box)
@@ -1131,10 +1243,19 @@ class MainWindow(QMainWindow):
         self.position_history_table.setHorizontalHeaderLabels(
             ["日期", "时间", "代码", "名称", "持仓", "交易均价", "回本价", "现价", "市值", "回本盈亏", "回本率"]
         )
-        self.position_history_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.position_history_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.position_history_table.horizontalHeader().setStretchLastSection(False)
         self.position_history_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.position_history_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.position_history_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.position_history_table.verticalHeader().setDefaultSectionSize(34)
+        history_table_height = 34 * 5 + self.position_history_table.horizontalHeader().height() + 18
+        self.position_history_table.setMinimumHeight(history_table_height)
         history_layout.addWidget(self.position_history_table)
-        layout.addWidget(history_box, 1)
+        history_margins = history_layout.contentsMargins()
+        history_box.setMinimumHeight(history_table_height + history_margins.top() + history_margins.bottom() + 28)
+        layout.addWidget(history_box)
+        layout.addStretch(1)
         return tab
 
     def _trade_tab(self) -> QWidget:
@@ -1737,11 +1858,12 @@ class MainWindow(QMainWindow):
             price = quote.price if quote else float(item["avg_cost"])
             qty = int(item["qty"])
             cost_amount = float(item["cost_amount"])
+            base_cost_amount = float(item.get("base_cost_amount") or cost_amount)
             value = price * qty
             floating = value - cost_amount
-            realized = sum(float(t.get("profit") or 0) for t in trades if t.get("code") == code and t.get("action") == "SELL")
-            total_profit = floating + realized
-            return_pct = total_profit / cost_amount * 100 if cost_amount else 0.0
+            realized = float(item.get("realized_profit") or 0.0)
+            total_profit = floating
+            return_pct = total_profit / base_cost_amount * 100 if base_cost_amount else 0.0
             code_trades = [t for t in trades if t.get("code") == code]
             buy_count = sum(1 for t in code_trades if t.get("action") == "BUY")
             sell_count = sum(1 for t in code_trades if t.get("action") == "SELL")
@@ -1768,7 +1890,7 @@ class MainWindow(QMainWindow):
                     total_profit,
                 ]
             )
-            total_cost += cost_amount
+            total_cost += base_cost_amount
             total_value += value
             total_floating += floating
             total_realized += realized
@@ -1997,6 +2119,12 @@ class MainWindow(QMainWindow):
             "positions": positions,
             "pending_orders": self.store.active_pending_orders(),
             "rules": "模拟交易；用户和 AI/Codex 下单均为限价委托，buy/sell 指令必须包含 limit_price；买入在实时价小于等于委托价时成交，卖出在实时价大于等于委托价时成交；A股/港股均按 T+1，今日买入不可卖出；买入数量按市场每手/最低申报规则校验；暂不计算手续费、印花税、汇率。",
+            "codex_order_schema": {
+                "new_order": {"action": "buy|sell", "code": "sh688820", "qty": 200, "limit_price": 166.5, "reason": "short reason"},
+                "cancel_order": {"action": "cancel", "order_id": "preferred when available", "code": "sh688820", "side": "sell", "reason": "short reason"},
+                "amend_order": {"action": "amend", "order_id": "preferred when available", "code": "sh688820", "side": "sell", "qty": 500, "limit_price": 166.5, "reason": "short reason"},
+                "matching": "Use order_id when possible. Without order_id, code + side must match exactly one active pending order.",
+            },
         }
 
     def ask_ai(self) -> None:
@@ -2058,7 +2186,7 @@ class MainWindow(QMainWindow):
         self.ai_output.setPlainText(text)
         self.status.setText(f"已加载 Codex 指令：{CODEX_ORDER_FILE}")
 
-    def execute_ai_orders(self, text: str, operator: str) -> None:
+    def _execute_ai_orders_legacy(self, text: str, operator: str) -> None:
         try:
             orders = json.loads(text)
             if isinstance(orders, dict):
@@ -2118,6 +2246,114 @@ class MainWindow(QMainWindow):
         if errors:
             message += "\n" + "\n".join(errors[:5])
         QMessageBox.information(self, "AI 执行结果", message)
+
+
+    def execute_ai_orders(self, text: str, operator: str) -> None:
+        try:
+            orders = json.loads(text)
+            if isinstance(orders, dict):
+                orders = orders.get("orders") or []
+            if not isinstance(orders, list):
+                raise ValueError("JSON must be an array, or an object with an orders array.")
+        except Exception as exc:
+            QMessageBox.warning(self, "JSON invalid", str(exc))
+            return
+
+        submitted = 0
+        cancelled = 0
+        updated = 0
+        errors: list[str] = []
+        for order in orders:
+            if not isinstance(order, dict):
+                errors.append(f"Skip invalid command: {order}")
+                continue
+            action = str(order.get("action") or "hold").lower()
+            if action == "hold":
+                continue
+            order_id = str(order.get("order_id") or order.get("id") or "").strip()
+            side = normalize_order_side(order.get("side") or order.get("order_action") or order.get("direction"))
+            code = normalize_code(str(order.get("code") or ""))
+            reason = str(order.get("reason") or "")
+
+            if action in ("cancel", "cancel_order"):
+                try:
+                    self.store.cancel_matching_pending_order(order_id, code or "", side, reason)
+                except Exception as exc:
+                    errors.append(f"cancel: {exc}")
+                    continue
+                cancelled += 1
+                continue
+
+            if action in ("amend", "modify", "update", "replace", "change_price"):
+                try:
+                    matched_order, match_error = self.store.resolve_active_pending_order(order_id, code or "", side)
+                    if match_error or matched_order is None:
+                        raise ValueError(match_error or "No matching active pending order.")
+                    matched_code = str(matched_order.get("code") or "")
+                    quote = self.quote_cache.get(matched_code)
+                    if not quote:
+                        self.quote_cache.update(self.quotes.fetch([matched_code]))
+                        quote = self.quote_cache.get(matched_code)
+                    qty_value = order.get("qty")
+                    price_value = order.get("limit_price")
+                    qty = int(qty_value) if qty_value not in (None, "") else None
+                    limit_price = float(price_value) if price_value not in (None, "") else None
+                    if qty is None and limit_price is None:
+                        raise ValueError("amend/modify requires qty or limit_price.")
+                    self.store.update_pending_order(
+                        order_id=order_id,
+                        code=code or "",
+                        action=side,
+                        qty=qty,
+                        limit_price=limit_price,
+                        quote=quote,
+                        reason=reason,
+                    )
+                except Exception as exc:
+                    errors.append(f"amend: {exc}")
+                    continue
+                updated += 1
+                continue
+
+            try:
+                qty = int(order.get("qty") or 0)
+            except Exception:
+                qty = 0
+            try:
+                limit_price = float(order.get("limit_price"))
+            except Exception:
+                limit_price = 0.0
+            if not code or qty <= 0 or action not in ("buy", "sell") or limit_price <= 0:
+                errors.append(f"Skip invalid command: {order}")
+                continue
+            quote = self.quote_cache.get(code)
+            if not quote:
+                self.quote_cache.update(self.quotes.fetch([code]))
+                quote = self.quote_cache.get(code)
+            if not quote:
+                errors.append(f"{code}: quote unavailable.")
+                continue
+            if action == "buy":
+                try:
+                    self.store.validate_buy_quantity(code, qty)
+                except Exception as exc:
+                    errors.append(f"{code}: {exc}")
+                    continue
+            try:
+                self.store.add_pending_order(action, quote, qty, limit_price, operator, reason)
+            except Exception as exc:
+                errors.append(f"{code}: {exc}")
+                continue
+            submitted += 1
+        executed = self.try_execute_pending_orders()
+        self.render_all()
+        message = (
+            f"Submitted {submitted} limit orders; "
+            f"cancelled {cancelled}; amended {updated}; filled {executed}."
+        )
+        if errors:
+            message += "\n" + "\n".join(errors[:5])
+        QMessageBox.information(self, "AI execution result", message)
 
 
 def main() -> int:
