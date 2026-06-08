@@ -1493,6 +1493,7 @@ class MainWindow(QMainWindow):
             ("持仓", "持仓买卖、加仓减仓和清仓入口。", self._position_tab),
             ("AI 工作台", "外部 AI 多智能体分析、候选指令、报告中心和审批入口。", self._agent_tab),
             ("复盘", "持仓复盘、账户曲线、操作者表现和交易质量。", self._review_workspace_tab),
+            ("策略", "内置量化信号、风控规则和 AI 可调用策略上下文。", self._strategy_tab),
             ("日志", "交易记录与 AI 托管日志。", self._log_workspace_tab),
             ("AI 设置", "OpenAI-compatible API、Codex JSON 指令和模型配置。", self._ai_tab),
         ]
@@ -1966,6 +1967,60 @@ class MainWindow(QMainWindow):
         review_page = self._review_tab()
         review_page.setMinimumHeight(520)
         layout.addWidget(review_page, 2)
+        return tab
+
+    def _strategy_tab(self) -> QWidget:
+        tab = QScrollArea()
+        tab.setWidgetResizable(True)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        tab.setWidget(content)
+
+        catalog_box = QGroupBox("内置策略目录")
+        catalog_layout = QVBoxLayout(catalog_box)
+        catalog_hint = QLabel("这些策略由本地程序确定性计算，作为 strategy_context 提供给外部 AI；它们不是 AI 结论。")
+        catalog_hint.setWordWrap(True)
+        catalog_layout.addWidget(catalog_hint)
+        self.strategy_catalog_table = QTableWidget(0, 5)
+        self.strategy_catalog_table.setHorizontalHeaderLabels(["策略", "状态", "输入", "输出", "AI 调用方式"])
+        self.strategy_catalog_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.strategy_catalog_table.horizontalHeader().setStretchLastSection(True)
+        self.strategy_catalog_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.strategy_catalog_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.strategy_catalog_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.strategy_catalog_table.verticalHeader().setDefaultSectionSize(34)
+        self.strategy_catalog_table.setMinimumHeight(34 * 6 + self.strategy_catalog_table.horizontalHeader().height() + 18)
+        catalog_layout.addWidget(self.strategy_catalog_table)
+        layout.addWidget(catalog_box)
+
+        matrix_box = QGroupBox("策略信号矩阵")
+        matrix_layout = QVBoxLayout(matrix_box)
+        matrix_hint = QLabel("矩阵按自选股和持仓合并展示，便于对比趋势、RSI、资金流、仓位风险和未成交委托。")
+        matrix_hint.setWordWrap(True)
+        matrix_layout.addWidget(matrix_hint)
+        self.strategy_signal_table = QTableWidget(0, 10)
+        self.strategy_signal_table.setHorizontalHeaderLabels(
+            ["代码", "名称", "最新价", "涨跌幅", "趋势", "RSI", "资金流", "风控", "仓位", "活动委托"]
+        )
+        self.strategy_signal_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.strategy_signal_table.horizontalHeader().setStretchLastSection(True)
+        self.strategy_signal_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.strategy_signal_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.strategy_signal_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.strategy_signal_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.strategy_signal_table.verticalHeader().setDefaultSectionSize(34)
+        self.strategy_signal_table.setMinimumHeight(34 * 8 + self.strategy_signal_table.horizontalHeader().height() + 18)
+        matrix_layout.addWidget(self.strategy_signal_table)
+        layout.addWidget(matrix_box, 1)
+
+        detail_box = QGroupBox("AI 可用上下文预览")
+        detail_layout = QVBoxLayout(detail_box)
+        self.strategy_context_preview = QPlainTextEdit()
+        self.strategy_context_preview.setReadOnly(True)
+        self.strategy_context_preview.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.strategy_context_preview.setMinimumHeight(220)
+        detail_layout.addWidget(self.strategy_context_preview)
+        layout.addWidget(detail_box, 1)
         return tab
 
     def _log_workspace_tab(self) -> QWidget:
@@ -2701,6 +2756,7 @@ class MainWindow(QMainWindow):
         self.render_positions()
         self.render_position_analysis()
         self.render_review()
+        self.render_strategy_workspace()
         self.render_pending_orders()
         self.render_trades()
         self.render_agent_report()
@@ -3035,6 +3091,59 @@ class MainWindow(QMainWindow):
             )
         return rows
 
+    def strategy_catalog_rows(self) -> list[dict[str, str]]:
+        return [
+            {
+                "name": "趋势动量",
+                "status": "启用",
+                "inputs": "最近 120 次价格记录",
+                "outputs": "短线上行/下行/震荡",
+                "usage": "strategy_context.market_rows[].trend",
+            },
+            {
+                "name": "RSI 冷热",
+                "status": "启用",
+                "inputs": "最近价格序列",
+                "outputs": "偏热、偏冷、强势、弱势、中性",
+                "usage": "strategy_context.market_rows[].rsi",
+            },
+            {
+                "name": "A 股资金流",
+                "status": "启用",
+                "inputs": "东方财富主力净流入与占比",
+                "outputs": "主力流入/流出/资金平衡",
+                "usage": "strategy_context.market_rows[].money_flow/main_net/main_pct",
+            },
+            {
+                "name": "仓位风控",
+                "status": "启用",
+                "inputs": "持仓、市值、现金、风控配置",
+                "outputs": "超仓、接近上限、仓位可控",
+                "usage": "strategy_context.market_rows[].risk 和 risk_audit",
+            },
+            {
+                "name": "交易规则",
+                "status": "启用",
+                "inputs": "交易日历、交易时段、每手规则、T+1",
+                "outputs": "委托预审、成交拦截、可卖数量",
+                "usage": "候选指令审批和 execute_ai_orders",
+            },
+            {
+                "name": "交易质量",
+                "status": "启用",
+                "inputs": "历史买卖记录与当前价",
+                "outputs": "买入后浮盈/浮亏、卖出收益、复盘提示",
+                "usage": "strategy_context.recent_trade_quality",
+            },
+            {
+                "name": "账户曲线",
+                "status": "启用",
+                "inputs": "账户历史快照",
+                "outputs": "收益率、当前回撤、最大回撤",
+                "usage": "strategy_context.account_curve",
+            },
+        ]
+
     def strategy_context(self) -> dict[str, Any]:
         curve_rows = self.account_curve_rows()
         latest_curve = curve_rows[-1] if curve_rows else {}
@@ -3042,6 +3151,7 @@ class MainWindow(QMainWindow):
         return {
             "note": "These are deterministic local strategy/risk signals for the AI to analyze. They are not an AI-generated conclusion.",
             "generated_at": now_str(),
+            "strategy_catalog": self.strategy_catalog_rows(),
             "account": self.account_summary(),
             "market_rows": self.agent_market_rows(),
             "operator_performance": self.operator_performance_rows(),
@@ -3564,6 +3674,54 @@ class MainWindow(QMainWindow):
                 str(item.get("hint") or ""),
             ]
             self._set_row(self.review_quality_table, row, values, float(item.get("sign") or 0))
+
+    def render_strategy_workspace(self) -> None:
+        if not hasattr(self, "strategy_catalog_table"):
+            return
+        catalog = self.strategy_catalog_rows()
+        self.strategy_catalog_table.setRowCount(len(catalog))
+        for row, item in enumerate(catalog):
+            values = [
+                str(item.get("name") or ""),
+                str(item.get("status") or ""),
+                str(item.get("inputs") or ""),
+                str(item.get("outputs") or ""),
+                str(item.get("usage") or ""),
+            ]
+            self._set_row(self.strategy_catalog_table, row, values, 0.0)
+            for col in (2, 3, 4):
+                cell = self.strategy_catalog_table.item(row, col)
+                if cell:
+                    cell.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
+        rows = self.agent_market_rows()
+        self.strategy_signal_table.setRowCount(len(rows))
+        for row, item in enumerate(rows):
+            sign = float(item.get("change_pct") or 0)
+            values = [
+                str(item.get("code") or ""),
+                str(item.get("name") or ""),
+                f"{float(item.get('price') or 0):.3f}" if item.get("price") is not None else "-",
+                pct(float(item.get("change_pct") or 0)) if item.get("change_pct") is not None else "-",
+                str(item.get("trend") or ""),
+                str(item.get("rsi") or ""),
+                str(item.get("money_flow") or ""),
+                str(item.get("risk") or ""),
+                pct(float(item.get("weight_pct") or 0)),
+                str(item.get("pending_count") or 0),
+            ]
+            self._set_row(self.strategy_signal_table, row, values, sign)
+            for col in (4, 5, 6, 7):
+                cell = self.strategy_signal_table.item(row, col)
+                if cell:
+                    cell.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
+        preview = {
+            "strategy_catalog": catalog,
+            "market_rows": rows,
+            "account_curve": self.strategy_context().get("account_curve"),
+        }
+        self.strategy_context_preview.setPlainText(json.dumps(preview, ensure_ascii=False, indent=2))
 
     def render_trades(self) -> None:
         trades = list(reversed(self.store.data.get("trades") or []))
