@@ -591,6 +591,7 @@ class PortfolioStore:
             "account_history": [],
             "ai_logs": [],
             "agent_reports": [],
+            "agent_chat": [],
             "risk": {
                 "enabled": True,
                 "block_st_buy": True,
@@ -692,6 +693,19 @@ class PortfolioStore:
             return None
         latest = reports[-1]
         return latest if isinstance(latest, dict) else None
+
+    def append_agent_chat(self, role: str, content: str, limit: int = 200) -> None:
+        chat = self.data.setdefault("agent_chat", [])
+        if not isinstance(chat, list):
+            chat = []
+            self.data["agent_chat"] = chat
+        chat.append({"time": now_str(), "role": role, "content": content})
+        self.data["agent_chat"] = chat[-limit:]
+        self.save()
+
+    def clear_agent_chat(self) -> None:
+        self.data["agent_chat"] = []
+        self.save()
 
     def ai_pipeline_config(self) -> dict[str, Any]:
         defaults = self._default()["ai_pipeline"]
@@ -2069,6 +2083,30 @@ class MainWindow(QMainWindow):
         controls.addWidget(open_report)
         layout.addLayout(controls)
 
+        chat_box = QGroupBox("Agent Chatroom")
+        chat_layout = QVBoxLayout(chat_box)
+        chat_hint = QLabel("围绕当前行情、持仓、风控、策略上下文和最新 AI 报告追问；Chatroom 只输出解释和建议，不直接提交委托。")
+        chat_hint.setWordWrap(True)
+        chat_layout.addWidget(chat_hint)
+        self.agent_chat_view = QPlainTextEdit()
+        self.agent_chat_view.setReadOnly(True)
+        self.agent_chat_view.setMinimumHeight(180)
+        self.agent_chat_view.setPlaceholderText("保存 API 配置后，可以询问：为什么当前不适合补仓？哪只股票需要优先降风险？")
+        chat_layout.addWidget(self.agent_chat_view)
+        chat_controls = QHBoxLayout()
+        self.agent_chat_input = QLineEdit()
+        self.agent_chat_input.setPlaceholderText("输入给 AI 的问题，例如：结合当前持仓，今天最该关注哪个风险？")
+        send_chat = QPushButton("发送")
+        clear_chat = QPushButton("清空对话")
+        send_chat.clicked.connect(self.send_agent_chat)
+        clear_chat.clicked.connect(self.clear_agent_chat)
+        self.agent_chat_input.returnPressed.connect(self.send_agent_chat)
+        chat_controls.addWidget(self.agent_chat_input, 1)
+        chat_controls.addWidget(send_chat)
+        chat_controls.addWidget(clear_chat)
+        chat_layout.addLayout(chat_controls)
+        layout.addWidget(chat_box)
+
         report_box = QGroupBox("报告中心")
         report_layout = QVBoxLayout(report_box)
         self.agent_report_table = QTableWidget(0, 5)
@@ -2669,6 +2707,7 @@ class MainWindow(QMainWindow):
         self.render_agent_pipeline()
         self.render_agent_report_center()
         self.render_agent_commands()
+        self.render_agent_chat()
         self.render_ai_logs()
 
     def overview_risk_summary(self, positions: dict[str, dict[str, Any]], summary: dict[str, float]) -> tuple[str, float]:
@@ -4217,6 +4256,137 @@ class MainWindow(QMainWindow):
             return
         self.execute_ai_orders(text, "AI")
         self.render_agent_commands()
+
+    def agent_chat_context(self) -> dict[str, Any]:
+        latest_report = self.store.latest_agent_report() or {}
+        short_report = {
+            "time": latest_report.get("time"),
+            "summary": latest_report.get("summary"),
+            "agents": latest_report.get("agents") or [],
+            "commands": latest_report.get("commands") or [],
+            "markdown_report": latest_report.get("markdown_report"),
+        } if latest_report else {}
+        return {
+            "generated_at": now_str(),
+            "account": self.account_summary(),
+            "market_rows": self.agent_market_rows(),
+            "positions": self.store.positions(),
+            "pending_orders": self.store.active_pending_orders(),
+            "risk_audit": self.risk_audit_rows(),
+            "recent_trade_quality": self.trade_quality_rows()[:20],
+            "latest_agent_report": short_report,
+        }
+
+    def render_agent_chat(self) -> None:
+        if not hasattr(self, "agent_chat_view"):
+            return
+        chat = self.store.data.get("agent_chat") if isinstance(self.store.data.get("agent_chat"), list) else []
+        role_names = {"user": "用户", "assistant": "AI", "system": "系统"}
+        blocks = []
+        for item in chat[-80:]:
+            if not isinstance(item, dict):
+                continue
+            role = role_names.get(str(item.get("role") or ""), str(item.get("role") or "未知"))
+            blocks.append(f"[{item.get('time') or ''}] {role}\n{item.get('content') or ''}")
+        self.agent_chat_view.setPlainText("\n\n".join(blocks))
+        bar = self.agent_chat_view.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def clear_agent_chat(self) -> None:
+        if QMessageBox.question(self, "清空对话", "确认清空 Agent Chatroom 的本地对话历史吗？") != QMessageBox.Yes:
+            return
+        self.store.clear_agent_chat()
+        self.render_agent_chat()
+        self.status.setText("Agent Chatroom 对话已清空。")
+
+    def send_agent_chat(self) -> None:
+        if not hasattr(self, "agent_chat_input"):
+            return
+        question = self.agent_chat_input.text().strip()
+        if not question:
+            self.status.setText("请输入要追问 AI 的问题。")
+            return
+        self.save_ai_config()
+        ai = self.store.data.get("ai") or {}
+        if not ai.get("api_key"):
+            QMessageBox.warning(self, "缺少 API Key", "Agent Chatroom 需要先在“AI 设置”页填写 OpenAI-compatible API Key。")
+            self.status.setText("未发送 Agent Chatroom：缺少 API Key")
+            return
+
+        self.store.append_agent_chat("user", question)
+        self.agent_chat_input.clear()
+        self.render_agent_chat()
+        context = self.agent_chat_context()
+        history = []
+        for item in (self.store.data.get("agent_chat") or [])[-10:]:
+            if not isinstance(item, dict):
+                continue
+            role = "assistant" if item.get("role") == "assistant" else "user"
+            history.append({"role": role, "content": str(item.get("content") or "")})
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是 AIStockSim 的 Agent Chatroom，只讨论模拟盘，不操作真实账户。"
+                    "回答要基于当前账户、行情、风险审计、策略上下文和最新多智能体报告。"
+                    "如果给出买卖想法，只能用自然语言说明条件和风险，不要输出可直接执行的 JSON 指令。"
+                    "需要明确区分事实、推断和不确定性。"
+                ),
+            },
+            {"role": "user", "content": "当前模拟盘上下文 JSON：\n" + json.dumps(context, ensure_ascii=False)},
+            *history,
+        ]
+        payload = {
+            "model": ai.get("model") or "gpt-4.1-mini",
+            "messages": messages,
+            "temperature": 0.3,
+        }
+        try:
+            self.status.setText("Agent Chatroom 正在请求 AI 回复...")
+            QApplication.processEvents()
+            resp = requests.post(
+                (ai.get("api_base") or "https://api.openai.com/v1").rstrip("/") + "/chat/completions",
+                headers={"Authorization": "Bearer " + ai["api_key"], "Content-Type": "application/json"},
+                json=payload,
+                timeout=60,
+            )
+            resp.raise_for_status()
+            answer = str(resp.json()["choices"][0]["message"]["content"]).strip()
+            self.store.append_agent_chat("assistant", answer)
+            self.store.append_ai_log(
+                {
+                    "source": "Agent Chatroom",
+                    "operator": "AI",
+                    "summary": question[:120],
+                    "submitted": 0,
+                    "cancelled": 0,
+                    "amended": 0,
+                    "filled": 0,
+                    "errors": [],
+                    "snapshot": context,
+                    "response": answer,
+                }
+            )
+            self.render_agent_chat()
+            self.render_ai_logs()
+            self.status.setText("Agent Chatroom 已回复。")
+        except Exception as exc:
+            self.store.append_ai_log(
+                {
+                    "source": "Agent Chatroom",
+                    "operator": "AI",
+                    "summary": question[:120],
+                    "submitted": 0,
+                    "cancelled": 0,
+                    "amended": 0,
+                    "filled": 0,
+                    "errors": [str(exc)],
+                    "snapshot": context,
+                }
+            )
+            self.render_ai_logs()
+            self.status.setText(f"Agent Chatroom 请求失败：{exc}")
+            QMessageBox.warning(self, "Agent Chatroom 请求失败", str(exc))
 
     def open_selected_agent_report(self) -> None:
         path = ""
