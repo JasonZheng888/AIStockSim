@@ -2175,6 +2175,23 @@ class MainWindow(QMainWindow):
         report_layout.addWidget(self.agent_report_table)
         layout.addWidget(report_box)
 
+        rebalance_box = QGroupBox("组合再平衡建议")
+        rebalance_layout = QVBoxLayout(rebalance_box)
+        rebalance_hint = QLabel("本地规则先给出仓位和风险层面的再平衡提示，AI 可在此基础上生成更完整的组合经理结论。")
+        rebalance_hint.setWordWrap(True)
+        rebalance_layout.addWidget(rebalance_hint)
+        self.rebalance_table = QTableWidget(0, 5)
+        self.rebalance_table.setHorizontalHeaderLabels(["对象", "建议", "原因", "触发条件", "AI 使用方式"])
+        self.rebalance_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.rebalance_table.horizontalHeader().setStretchLastSection(True)
+        self.rebalance_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.rebalance_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.rebalance_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.rebalance_table.verticalHeader().setDefaultSectionSize(34)
+        self.rebalance_table.setMinimumHeight(34 * 5 + self.rebalance_table.horizontalHeader().height() + 18)
+        rebalance_layout.addWidget(self.rebalance_table)
+        layout.addWidget(rebalance_box)
+
         approval_box = QGroupBox("候选指令审批")
         approval_layout = QVBoxLayout(approval_box)
         approval_hint = QLabel("AI 只生成候选指令；真正执行仍需用户确认或明确托管授权，并继续通过现金、T+1、每手和风控校验。")
@@ -2763,6 +2780,7 @@ class MainWindow(QMainWindow):
         self.render_agent_pipeline()
         self.render_agent_report_center()
         self.render_agent_commands()
+        self.render_rebalance_suggestions()
         self.render_agent_chat()
         self.render_ai_logs()
 
@@ -3152,6 +3170,7 @@ class MainWindow(QMainWindow):
             "note": "These are deterministic local strategy/risk signals for the AI to analyze. They are not an AI-generated conclusion.",
             "generated_at": now_str(),
             "strategy_catalog": self.strategy_catalog_rows(),
+            "rebalance_suggestions": self.rebalance_suggestions(),
             "account": self.account_summary(),
             "market_rows": self.agent_market_rows(),
             "operator_performance": self.operator_performance_rows(),
@@ -3235,6 +3254,64 @@ class MainWindow(QMainWindow):
         else:
             add("AI 接入", "未配置", "未填写 API Key 时不会调用外部 AI，只能使用本地策略上下文。", 0.0)
         return rows
+
+    def rebalance_suggestions(self) -> list[dict[str, Any]]:
+        summary = self.account_summary()
+        equity = float(summary.get("equity") or 0)
+        available_cash = float(summary.get("available_cash") or 0)
+        cfg = self.store.risk_config()
+        max_position = float(cfg.get("max_position_pct", 65.0))
+        rows: list[dict[str, Any]] = []
+
+        def add(target: str, suggestion: str, reason: str, condition: str, usage: str, priority: float = 0.0) -> None:
+            rows.append(
+                {
+                    "target": target,
+                    "suggestion": suggestion,
+                    "reason": reason,
+                    "condition": condition,
+                    "usage": usage,
+                    "priority": priority,
+                }
+            )
+
+        positions = self.store.positions()
+        if not positions:
+            add("组合", "等待建仓", "当前没有持仓。", "先添加自选并观察策略信号。", "组合经理可生成观察清单。", 0.0)
+
+        for code, item in positions.items():
+            quote = self.quote_cache.get(code)
+            price = quote.price if quote else float(item.get("breakeven_cost") or item.get("avg_cost") or 0)
+            qty = int(item.get("qty") or 0)
+            value = price * qty
+            weight = value / equity * 100 if equity else 0.0
+            name = quote.name if quote else str(item.get("name") or code)
+            breakeven = float(item.get("breakeven_cost") or item.get("avg_cost") or 0)
+            floating = (price - breakeven) * qty if qty and breakeven else 0.0
+            available = int(item.get("available") or 0)
+            label = f"{code} {name}"
+            if weight >= max_position:
+                add(label, "优先降仓", f"单票仓位 {weight:.1f}% 已超过风控上限 {max_position:.1f}%。", "反弹或 AI 确认弱势时分批降低集中度。", "风险经理/组合经理必须优先处理。", -1.0)
+            elif weight >= max_position * 0.8:
+                add(label, "控制加仓", f"单票仓位 {weight:.1f}% 接近上限。", "除非趋势和资金流同时改善，否则不追加仓位。", "组合经理给买入建议时需解释集中度。", -0.5)
+            if floating < 0 and breakeven and price / breakeven - 1 <= -0.08:
+                add(label, "复核止损", f"较回本价浮亏约 {pct(price / breakeven * 100 - 100)}。", "若反弹无量或风险审计转弱，优先确认减仓条件。", "风险经理需要给出是否继续承受回撤。", -0.7)
+            if "ST" in str(name).upper():
+                add(label, "风险票观察", "名称包含 ST，买入受限且波动风险更高。", "只考虑可卖仓位的风险释放，不做盲目补仓。", "新闻/情绪和风险经理必须单独说明。", -0.8)
+            if qty and available <= 0:
+                add(label, "T+1 等待", "当前持仓暂无可卖数量。", "等待下一交易日可卖后再执行减仓计划。", "候选卖出指令会被可卖数量预审拦截。", -0.2)
+
+        if equity and available_cash / equity < 0.05:
+            add("现金", "保留流动性", f"可用资金仅占总资产 {available_cash / equity * 100:.1f}%。", "除非出现高胜率机会，否则减少新增买入。", "组合经理应优先给出持有/减仓而非补仓。", -0.4)
+        elif equity and available_cash / equity >= 0.2:
+            add("现金", "可等待机会", f"可用资金占总资产 {available_cash / equity * 100:.1f}%。", "仅在趋势、资金流、风险审计都支持时分批试错。", "组合经理可提出低仓位试探条件。", 0.3)
+
+        active_orders = self.store.active_pending_orders()
+        if active_orders:
+            add("未成交委托", "复核挂单", f"当前有 {len(active_orders)} 条活动委托。", "行情刷新后检查是否仍符合触发条件。", "AI 候选改价/撤单需先匹配活动委托。", -0.2)
+        if not rows:
+            add("组合", "保持观察", "仓位、现金和委托暂未触发明显再平衡条件。", "等待趋势/资金流或 AI 报告给出新证据。", "组合经理可以维持 hold。", 0.2)
+        return rows[:12]
 
     def decision_chain_rows(self) -> list[dict[str, Any]]:
         report = self.store.latest_agent_report() or {}
@@ -4263,6 +4340,26 @@ class MainWindow(QMainWindow):
                     if col == 2:
                         item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
+    def render_rebalance_suggestions(self) -> None:
+        if not hasattr(self, "rebalance_table"):
+            return
+        rows = self.rebalance_suggestions()
+        self.rebalance_table.setRowCount(len(rows))
+        for row, item in enumerate(rows):
+            sign = float(item.get("priority") or 0)
+            values = [
+                str(item.get("target") or ""),
+                str(item.get("suggestion") or ""),
+                str(item.get("reason") or ""),
+                str(item.get("condition") or ""),
+                str(item.get("usage") or ""),
+            ]
+            self._set_row(self.rebalance_table, row, values, sign)
+            for col in (2, 3, 4):
+                cell = self.rebalance_table.item(row, col)
+                if cell:
+                    cell.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
     def render_agent_commands(self, report: dict[str, Any] | None = None) -> None:
         if not hasattr(self, "agent_command_table"):
             return
@@ -4431,6 +4528,7 @@ class MainWindow(QMainWindow):
             "positions": self.store.positions(),
             "pending_orders": self.store.active_pending_orders(),
             "risk_audit": self.risk_audit_rows(),
+            "rebalance_suggestions": self.rebalance_suggestions(),
             "recent_trade_quality": self.trade_quality_rows()[:20],
             "latest_agent_report": short_report,
         }
