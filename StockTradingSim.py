@@ -64,6 +64,38 @@ DEFAULT_HK_BOARD_LOTS = {
     "hk09988": 100,
 }
 REFRESH_INTERVAL_OPTIONS = [1, 2, 3, 5, 10, 15, 30, 60]
+DEFAULT_AI_PIPELINE = [
+    {
+        "enabled": True,
+        "role": "技术面分析师",
+        "inputs": "价格、涨跌幅、趋势、RSI、交易时段",
+        "outputs": "技术观点、关键价位、动量风险",
+    },
+    {
+        "enabled": True,
+        "role": "资金流分析师",
+        "inputs": "A 股主力资金流、涨跌幅、成交状态",
+        "outputs": "资金情绪、背离提示、强弱排序",
+    },
+    {
+        "enabled": True,
+        "role": "新闻/情绪分析师",
+        "inputs": "预留新闻、公告、行业事件、用户补充信息",
+        "outputs": "催化剂、舆情风险、需人工确认事项",
+    },
+    {
+        "enabled": True,
+        "role": "风险经理",
+        "inputs": "仓位、现金、冻结资金、T+1、每手规则、风控配置",
+        "outputs": "风险结论、拦截原因、减仓或观望条件",
+    },
+    {
+        "enabled": True,
+        "role": "组合经理",
+        "inputs": "各角色结论、账户目标、候选订单、回撤",
+        "outputs": "组合建议、再平衡建议、候选 JSON 指令",
+    },
+]
 DEFAULT_TRADING_CALENDAR = {
     "version": "2026.1",
     "markets": {
@@ -508,6 +540,10 @@ class PortfolioStore:
                 "model": "gpt-4.1-mini",
                 "auto_execute": False,
             },
+            "ai_pipeline": {
+                "max_retries": 2,
+                "agents": [agent.copy() for agent in DEFAULT_AI_PIPELINE],
+            },
         }
 
     def load(self) -> None:
@@ -592,6 +628,44 @@ class PortfolioStore:
             return None
         latest = reports[-1]
         return latest if isinstance(latest, dict) else None
+
+    def ai_pipeline_config(self) -> dict[str, Any]:
+        defaults = self._default()["ai_pipeline"]
+        cfg = self.data.setdefault("ai_pipeline", {})
+        if not isinstance(cfg, dict):
+            cfg = defaults.copy()
+            self.data["ai_pipeline"] = cfg
+        try:
+            cfg["max_retries"] = max(0, min(5, int(cfg.get("max_retries", defaults["max_retries"]))))
+        except Exception:
+            cfg["max_retries"] = defaults["max_retries"]
+        agents = cfg.get("agents")
+        if not isinstance(agents, list) or not agents:
+            cfg["agents"] = [agent.copy() for agent in DEFAULT_AI_PIPELINE]
+        else:
+            normalized = []
+            for agent in agents:
+                if not isinstance(agent, dict):
+                    continue
+                normalized.append(
+                    {
+                        "enabled": bool(agent.get("enabled", True)),
+                        "role": str(agent.get("role") or "AI 代理"),
+                        "inputs": str(agent.get("inputs") or agent.get("input") or ""),
+                        "outputs": str(agent.get("outputs") or agent.get("output") or ""),
+                    }
+                )
+            cfg["agents"] = normalized or [agent.copy() for agent in DEFAULT_AI_PIPELINE]
+        return cfg
+
+    def set_ai_pipeline_config(self, cfg: dict[str, Any]) -> None:
+        self.data["ai_pipeline"] = cfg
+        self.ai_pipeline_config()
+        self.save()
+
+    def reset_ai_pipeline_config(self) -> None:
+        self.data["ai_pipeline"] = self._default()["ai_pipeline"]
+        self.save()
 
     @property
     def cash(self) -> float:
@@ -1819,11 +1893,28 @@ class MainWindow(QMainWindow):
 
         pipeline_box = QGroupBox("AI Agent Pipeline")
         pipeline_layout = QVBoxLayout(pipeline_box)
-        pipeline_hint = QLabel("外部 AI 会读取本地 strategy_context；这里展示 2.0.0 规划中的角色化投研流水线。")
+        pipeline_hint = QLabel("外部 AI 会读取本地 strategy_context；这里可配置本次多智能体投研流水线。")
         pipeline_hint.setWordWrap(True)
         pipeline_layout.addWidget(pipeline_hint)
-        self.agent_pipeline_table = QTableWidget(0, 5)
-        self.agent_pipeline_table.setHorizontalHeaderLabels(["阶段", "角色", "输入上下文", "结构化输出", "状态"])
+
+        pipeline_controls = QHBoxLayout()
+        self.pipeline_retries = QSpinBox()
+        self.pipeline_retries.setRange(0, 5)
+        self.pipeline_retries.setValue(int(self.store.ai_pipeline_config().get("max_retries", 2)))
+        self.pipeline_retries.valueChanged.connect(self.save_ai_pipeline_from_ui)
+        toggle_agent = QPushButton("启用/停用选中")
+        reset_pipeline = QPushButton("恢复默认流水线")
+        toggle_agent.clicked.connect(self.toggle_selected_pipeline_agent)
+        reset_pipeline.clicked.connect(self.reset_ai_pipeline)
+        pipeline_controls.addWidget(QLabel("失败重试"))
+        pipeline_controls.addWidget(self.pipeline_retries)
+        pipeline_controls.addWidget(toggle_agent)
+        pipeline_controls.addWidget(reset_pipeline)
+        pipeline_controls.addStretch(1)
+        pipeline_layout.addLayout(pipeline_controls)
+
+        self.agent_pipeline_table = QTableWidget(0, 6)
+        self.agent_pipeline_table.setHorizontalHeaderLabels(["启用", "阶段", "角色", "输入上下文", "结构化输出", "状态"])
         self.agent_pipeline_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.agent_pipeline_table.horizontalHeader().setStretchLastSection(True)
         self.agent_pipeline_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -1867,8 +1958,14 @@ class MainWindow(QMainWindow):
         approval_hint = QLabel("AI 只生成候选指令；真正执行仍需用户确认或明确托管授权，并继续通过现金、T+1、每手和风控校验。")
         approval_hint.setWordWrap(True)
         approval_layout.addWidget(approval_hint)
-        self.agent_command_table = QTableWidget(0, 6)
-        self.agent_command_table.setHorizontalHeaderLabels(["动作", "代码", "数量", "委托价", "原因", "审批状态"])
+        approval_controls = QHBoxLayout()
+        approve_all = QPushButton("执行全部可执行候选")
+        approve_all.clicked.connect(self.execute_agent_candidate_commands)
+        approval_controls.addStretch(1)
+        approval_controls.addWidget(approve_all)
+        approval_layout.addLayout(approval_controls)
+        self.agent_command_table = QTableWidget(0, 7)
+        self.agent_command_table.setHorizontalHeaderLabels(["动作", "代码", "数量", "委托价", "原因", "预审", "审批状态"])
         self.agent_command_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.agent_command_table.horizontalHeader().setStretchLastSection(True)
         self.agent_command_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -3199,10 +3296,22 @@ class MainWindow(QMainWindow):
         }
 
     def ai_agent_prompt(self) -> str:
+        cfg = self.store.ai_pipeline_config()
+        agents = [agent for agent in (cfg.get("agents") or []) if agent.get("enabled", True)]
+        if not agents:
+            agents = [agent.copy() for agent in DEFAULT_AI_PIPELINE]
+        agent_lines = []
+        for index, agent in enumerate(agents, 1):
+            agent_lines.append(
+                f"{index}. {agent.get('role')}：输入={agent.get('inputs')}；输出={agent.get('outputs')}"
+            )
+        agent_spec = "；".join(agent_lines)
         return (
             "你是 AIStockSim 的外部 AI 多智能体投资分析模块，只分析模拟盘，不操作真实账户。"
             "输入里包含真实行情、持仓、委托、风控配置，以及本地策略上下文 strategy_context。"
             "strategy_context 只是确定性策略/风控信号，供你参考，不是最终结论；最终多智能体分析必须由你完成。"
+            f"本次启用的 agent pipeline 是：{agent_spec}。"
+            "请严格按照启用的 agent 输出 agents 数组，除非某角色输入不足，否则不要省略。"
             "请严格输出一个 JSON 对象，不要 Markdown，不要解释性前后缀。"
             "JSON 格式："
             "{\"summary\":\"一句话总览\","
@@ -3246,6 +3355,8 @@ class MainWindow(QMainWindow):
         positions = snapshot.get("positions") if isinstance(snapshot.get("positions"), dict) else {}
         pending_orders = snapshot.get("pending_orders") if isinstance(snapshot.get("pending_orders"), list) else []
         market_rows = strategy.get("market_rows") if isinstance(strategy.get("market_rows"), list) else []
+        pipeline = report.get("pipeline") if isinstance(report.get("pipeline"), dict) else {}
+        attempts = report.get("attempts") if isinstance(report.get("attempts"), list) else []
 
         lines: list[str] = [
             f"# AIStockSim AI 多智能体分析报告",
@@ -3255,6 +3366,19 @@ class MainWindow(QMainWindow):
             f"- 摘要：{report.get('summary') or ''}",
             "",
             "> 本报告由用户配置的 OpenAI-compatible API 生成；本地策略、资金流、风控和复盘数据仅作为 AI 分析上下文。模拟交易练习不构成投资建议。",
+            "",
+            "## 工作流追踪",
+            "",
+            self.markdown_table(
+                ["启用代理", "失败重试", "实际尝试"],
+                [
+                    [
+                        "、".join(str(agent.get("role") or "") for agent in (pipeline.get("agents") or []) if isinstance(agent, dict)) or "-",
+                        str(pipeline.get("max_retries", "")),
+                        "；".join(f"{item.get('attempt')}:{item.get('status')}" for item in attempts if isinstance(item, dict)) or "-",
+                    ]
+                ],
+            ),
             "",
             "## 账户快照",
             "",
@@ -3420,6 +3544,10 @@ class MainWindow(QMainWindow):
             self.status.setText("未生成 AI 分析：缺少 API Key")
             return
 
+        pipeline_cfg = self.store.ai_pipeline_config()
+        pipeline_agents = [agent.copy() for agent in pipeline_cfg.get("agents", []) if agent.get("enabled", True)]
+        if not pipeline_agents:
+            pipeline_agents = [agent.copy() for agent in DEFAULT_AI_PIPELINE]
         snapshot = self.account_snapshot()
         payload = {
             "model": ai.get("model") or "gpt-4.1-mini",
@@ -3429,19 +3557,36 @@ class MainWindow(QMainWindow):
             ],
             "temperature": 0.2,
         }
+        max_retries = int(pipeline_cfg.get("max_retries", 2))
+        attempts: list[dict[str, Any]] = []
         try:
-            self.status.setText("正在请求 AI 多智能体分析...")
-            QApplication.processEvents()
-            resp = requests.post(
-                (ai.get("api_base") or "https://api.openai.com/v1").rstrip("/") + "/chat/completions",
-                headers={"Authorization": "Bearer " + ai["api_key"], "Content-Type": "application/json"},
-                json=payload,
-                timeout=60,
-            )
-            resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"]
-            report = self.normalize_ai_agent_report(self.extract_json_payload(content), content)
+            report = None
+            content = ""
+            for attempt in range(max_retries + 1):
+                attempt_no = attempt + 1
+                self.status.setText(f"正在请求 AI 多智能体分析... 第 {attempt_no}/{max_retries + 1} 次")
+                QApplication.processEvents()
+                try:
+                    resp = requests.post(
+                        (ai.get("api_base") or "https://api.openai.com/v1").rstrip("/") + "/chat/completions",
+                        headers={"Authorization": "Bearer " + ai["api_key"], "Content-Type": "application/json"},
+                        json=payload,
+                        timeout=60,
+                    )
+                    resp.raise_for_status()
+                    content = resp.json()["choices"][0]["message"]["content"]
+                    report = self.normalize_ai_agent_report(self.extract_json_payload(content), content)
+                    attempts.append({"attempt": attempt_no, "status": "success"})
+                    break
+                except Exception as attempt_exc:
+                    attempts.append({"attempt": attempt_no, "status": "failed", "error": str(attempt_exc)})
+                    if attempt >= max_retries:
+                        raise
+            if report is None:
+                raise ValueError("AI 分析未返回有效报告。")
             report["snapshot"] = snapshot
+            report["pipeline"] = {"max_retries": max_retries, "agents": pipeline_agents}
+            report["attempts"] = attempts
             report_path = self.write_ai_report_markdown(report)
             report["markdown_report"] = report_path
             self.store.append_agent_report(report)
@@ -3458,6 +3603,8 @@ class MainWindow(QMainWindow):
                     "report_id": report.get("id"),
                     "report_file": report_path,
                     "commands": report.get("commands") or [],
+                    "pipeline": report.get("pipeline"),
+                    "attempts": attempts,
                     "snapshot": snapshot,
                     "response": content,
                 }
@@ -3465,6 +3612,7 @@ class MainWindow(QMainWindow):
             self.render_agent_report(report)
             self.render_ai_logs()
             self.render_overview()
+            self.render_agent_pipeline()
             self.status.setText(f"已生成 AI 多智能体分析并保存报告：{report_path}")
         except Exception as exc:
             self.store.append_ai_log(
@@ -3477,6 +3625,8 @@ class MainWindow(QMainWindow):
                     "amended": 0,
                     "filled": 0,
                     "errors": [str(exc)],
+                    "pipeline": {"max_retries": max_retries, "agents": pipeline_agents},
+                    "attempts": attempts,
                     "snapshot": snapshot,
                 }
             )
@@ -3516,19 +3666,62 @@ class MainWindow(QMainWindow):
             return
         report = self.store.latest_agent_report() or {}
         roles = {str(agent.get("role") or "") for agent in (report.get("agents") or []) if isinstance(agent, dict)}
-        rows = [
-            ("1", "技术面分析师", "价格、趋势、RSI、交易时段", "技术观点、关键价位、风险点"),
-            ("2", "资金流分析师", "A 股主力资金流、涨跌幅、成交状态", "资金情绪、背离提示"),
-            ("3", "新闻/情绪分析师", "预留：新闻、公告、舆情、行业事件", "催化剂、情绪风险"),
-            ("4", "风险经理", "仓位、现金、冻结资金、T+1、每手规则", "风控结论、拦截原因"),
-            ("5", "组合经理", "所有角色结论、账户目标、候选订单", "组合建议、候选 JSON 指令"),
-        ]
-        self.agent_pipeline_table.setRowCount(len(rows))
-        for row, values in enumerate(rows):
-            role = values[1]
+        cfg = self.store.ai_pipeline_config()
+        if hasattr(self, "pipeline_retries"):
+            self.pipeline_retries.blockSignals(True)
+            self.pipeline_retries.setValue(int(cfg.get("max_retries", 2)))
+            self.pipeline_retries.blockSignals(False)
+        agents = cfg.get("agents") or []
+        self.agent_pipeline_table.setRowCount(len(agents))
+        for row, agent in enumerate(agents):
+            role = str(agent.get("role") or "")
+            enabled = bool(agent.get("enabled", True))
             matched = any(role[:2] in existing or existing[:2] in role for existing in roles)
-            status = "已生成" if matched else "等待 AI 输出"
-            self._set_row(self.agent_pipeline_table, row, [*values, status], 1.0 if matched else 0.0)
+            status = "已生成" if matched else "等待 AI 输出" if enabled else "已停用"
+            values = [
+                "是" if enabled else "否",
+                str(row + 1),
+                role,
+                str(agent.get("inputs") or ""),
+                str(agent.get("outputs") or ""),
+                status,
+            ]
+            self._set_row(self.agent_pipeline_table, row, values, 1.0 if matched else 0.0)
+            for col in range(self.agent_pipeline_table.columnCount()):
+                item = self.agent_pipeline_table.item(row, col)
+                if item:
+                    item.setData(Qt.UserRole, row)
+                    if col >= 3:
+                        item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
+    def save_ai_pipeline_from_ui(self) -> None:
+        cfg = self.store.ai_pipeline_config()
+        cfg["max_retries"] = int(self.pipeline_retries.value()) if hasattr(self, "pipeline_retries") else int(cfg.get("max_retries", 2))
+        self.store.set_ai_pipeline_config(cfg)
+        self.status.setText(f"AI 分析失败重试次数已设置为 {cfg['max_retries']}")
+
+    def toggle_selected_pipeline_agent(self) -> None:
+        if not hasattr(self, "agent_pipeline_table"):
+            return
+        row = self.agent_pipeline_table.currentRow()
+        if row < 0:
+            self.status.setText("请先选择一个 AI 代理。")
+            return
+        cfg = self.store.ai_pipeline_config()
+        agents = cfg.get("agents") or []
+        if row >= len(agents):
+            return
+        agents[row]["enabled"] = not bool(agents[row].get("enabled", True))
+        cfg["agents"] = agents
+        self.store.set_ai_pipeline_config(cfg)
+        self.render_agent_pipeline()
+        state = "启用" if agents[row]["enabled"] else "停用"
+        self.status.setText(f"已{state}代理：{agents[row].get('role')}")
+
+    def reset_ai_pipeline(self) -> None:
+        self.store.reset_ai_pipeline_config()
+        self.render_agent_pipeline()
+        self.status.setText("AI agent pipeline 已恢复默认。")
 
     def render_agent_report_center(self) -> None:
         if not hasattr(self, "agent_report_table"):
@@ -3563,20 +3756,84 @@ class MainWindow(QMainWindow):
             if not isinstance(command, dict):
                 continue
             action = str(command.get("action") or "hold").lower()
-            status = "无需执行" if action == "hold" else "待用户确认"
+            audit = self.audit_candidate_command(command)
+            status = "无需执行" if action == "hold" else "待用户确认" if audit == "可执行" else "需修正"
             values = [
                 action,
                 str(command.get("code") or ""),
                 str(command.get("qty") or ""),
                 str(command.get("limit_price") or ""),
                 str(command.get("reason") or ""),
+                audit,
                 status,
             ]
-            self._set_row(self.agent_command_table, row, values, 0.0)
+            self._set_row(self.agent_command_table, row, values, -1.0 if audit != "可执行" and action != "hold" else 0.0)
             for col in range(self.agent_command_table.columnCount()):
                 item = self.agent_command_table.item(row, col)
                 if item and col == 4:
                     item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
+    def audit_candidate_command(self, command: dict[str, Any]) -> str:
+        if not isinstance(command, dict):
+            return "格式无效"
+        action = str(command.get("action") or "hold").lower()
+        if action == "hold":
+            return "无需执行"
+        if action in ("cancel", "cancel_order", "amend", "modify", "update", "replace", "change_price"):
+            order_id = str(command.get("order_id") or command.get("id") or "").strip()
+            side = normalize_order_side(command.get("side") or command.get("order_action") or command.get("direction"))
+            code = normalize_code(str(command.get("code") or ""))
+            order, error = self.store.resolve_active_pending_order(order_id, code or "", side)
+            if error or order is None:
+                return str(error or "没有匹配的活动委托")
+            if action in ("amend", "modify", "update", "replace", "change_price"):
+                qty_value = command.get("qty")
+                price_value = command.get("limit_price")
+                qty = int(qty_value) if qty_value not in (None, "") else int(order.get("qty") or 0)
+                limit_price = float(price_value) if price_value not in (None, "") else float(order.get("limit_price") or 0)
+                code = str(order.get("code") or "")
+                quote = self.quote_cache.get(code)
+                if quote:
+                    risk_errors = self.risk_violations_for_order(str(order.get("action") or ""), quote, qty, limit_price, order, check_pending_limit=False)
+                    if risk_errors:
+                        return "风控拦截：" + "；".join(risk_errors)
+            return "可执行"
+        if action not in ("buy", "sell"):
+            return "未知动作"
+        code = normalize_code(str(command.get("code") or ""))
+        if not code:
+            return "缺少代码"
+        quote = self.quote_cache.get(code)
+        if not quote:
+            return "暂无行情"
+        try:
+            qty = int(command.get("qty") or 0)
+            limit_price = float(command.get("limit_price") or 0)
+        except Exception:
+            return "数量或价格无效"
+        if qty <= 0 or limit_price <= 0:
+            return "数量或价格无效"
+        time_error = trading_time_error(code)
+        if time_error:
+            return time_error
+        try:
+            if action == "buy":
+                self.store.validate_buy_quantity(code, qty)
+                required = round(limit_price * qty, 2)
+                available = self.store.available_cash()
+                if required > available + 1e-6:
+                    return f"可用资金不足，需 {money(required, quote.currency)}"
+            else:
+                self.store.validate_trade_quantity(code, qty)
+                available_qty = self.store.available_sell_qty(code)
+                if qty > available_qty:
+                    return f"可卖不足，剩余 {available_qty} 股"
+        except Exception as exc:
+            return str(exc)
+        risk_errors = self.risk_violations_for_order(action, quote, qty, limit_price)
+        if risk_errors:
+            return "风控拦截：" + "；".join(risk_errors)
+        return "可执行"
 
     def render_selected_agent_detail(self) -> None:
         if not hasattr(self, "agent_table") or not hasattr(self, "agent_detail"):
@@ -3612,6 +3869,34 @@ class MainWindow(QMainWindow):
             return
         self.ai_output.setPlainText(json.dumps(commands, ensure_ascii=False, indent=2))
         self.status.setText("已将候选 JSON 指令加载到 AI 设置页，可继续人工检查后执行。")
+
+    def executable_agent_commands(self) -> list[dict[str, Any]]:
+        report = self.store.latest_agent_report() or {}
+        commands = report.get("commands") if isinstance(report.get("commands"), list) else []
+        executable = []
+        for command in commands:
+            if not isinstance(command, dict):
+                continue
+            if str(command.get("action") or "hold").lower() == "hold":
+                continue
+            if self.audit_candidate_command(command) == "可执行":
+                executable.append(command)
+        return executable
+
+    def execute_agent_candidate_commands(self) -> None:
+        commands = self.executable_agent_commands()
+        if not commands:
+            self.status.setText("没有通过预审的候选指令可执行。")
+            return
+        text = json.dumps(commands, ensure_ascii=False, indent=2)
+        if QMessageBox.question(
+            self,
+            "执行候选指令",
+            f"将执行 {len(commands)} 条通过预审的 AI 候选指令。\n\n这些仍会再次经过模拟盘规则和风控校验，确认继续吗？",
+        ) != QMessageBox.Yes:
+            return
+        self.execute_ai_orders(text, "AI")
+        self.render_agent_commands()
 
     def open_selected_agent_report(self) -> None:
         path = ""
@@ -3956,6 +4241,7 @@ class MainWindow(QMainWindow):
             "positions": positions,
             "pending_orders": self.store.active_pending_orders(),
             "risk": self.store.risk_config(),
+            "ai_pipeline": self.store.ai_pipeline_config(),
             "strategy_signals": strategy_signals,
             "strategy_context": self.strategy_context(),
             "latest_agent_report": {
