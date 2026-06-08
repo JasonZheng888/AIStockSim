@@ -28,6 +28,8 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -36,9 +38,9 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSpinBox,
+    QStackedWidget,
     QStyle,
     QSystemTrayIcon,
-    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -47,7 +49,7 @@ from PySide6.QtWidgets import (
 
 
 APP_NAME = "StockTradingSim"
-APP_VERSION = "1.1.0"
+APP_VERSION = "2.0.0-dev"
 DISPLAY_NAME = "AIStockSim - AI模拟炒股及摸鱼盯盘工具"
 CONFIG_DIR = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~"), APP_NAME)
 CONFIG_FILE = os.path.join(CONFIG_DIR, "portfolio.json")
@@ -1282,26 +1284,90 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         root = QWidget()
-        main = QVBoxLayout(root)
+        shell = QHBoxLayout(root)
+        shell.setContentsMargins(0, 0, 0, 0)
+        shell.setSpacing(0)
+
+        nav_panel = QWidget()
+        nav_panel.setObjectName("NavPanel")
+        nav_panel.setFixedWidth(184)
+        nav_layout = QVBoxLayout(nav_panel)
+        nav_layout.setContentsMargins(14, 16, 14, 14)
+        nav_layout.setSpacing(10)
+
+        brand = QLabel("AIStockSim")
+        brand.setObjectName("BrandTitle")
+        subtitle = QLabel("2.0 工作台")
+        subtitle.setObjectName("BrandSubtitle")
+        nav_layout.addWidget(brand)
+        nav_layout.addWidget(subtitle)
+
+        self.nav_list = QListWidget()
+        self.nav_list.setObjectName("MainNav")
+        self.nav_list.setSpacing(3)
+        self.nav_list.setFocusPolicy(Qt.NoFocus)
+        nav_layout.addWidget(self.nav_list, 1)
+
+        compact_btn = QPushButton("盯盘模式")
+        compact_btn.clicked.connect(self.enter_compact_mode)
+        settings_btn = QPushButton("全局设置")
+        settings_btn.clicked.connect(self.open_main_settings)
+        nav_layout.addWidget(compact_btn)
+        nav_layout.addWidget(settings_btn)
+
+        workspace = QWidget()
+        workspace_layout = QVBoxLayout(workspace)
+        workspace_layout.setContentsMargins(14, 12, 14, 10)
+        workspace_layout.setSpacing(10)
         self.status = QLabel("")
         self.status.setStyleSheet("font-size: 13px; color: #555;")
-        main.addWidget(self._account_panel())
+        workspace_layout.addWidget(self._account_panel())
 
-        tabs = QTabWidget()
-        tabs.addTab(self._overview_tab(), "总览")
-        tabs.addTab(self._market_tab(), "行情与下单")
-        tabs.addTab(self._position_tab(), "持仓")
-        tabs.addTab(self._position_analysis_tab(), "持仓分析")
-        tabs.addTab(self._review_tab(), "复盘分析")
-        tabs.addTab(self._trade_tab(), "交易记录")
-        tabs.addTab(self._agent_tab(), "多智能体分析")
-        tabs.addTab(self._ai_log_tab(), "AI 托管日志")
-        tabs.addTab(self._ai_tab(), "AI 接入")
-        main.addWidget(tabs, 1)
-        main.addWidget(self.status)
+        self.page_title = QLabel("")
+        self.page_title.setObjectName("PageTitle")
+        self.page_hint = QLabel("")
+        self.page_hint.setObjectName("PageHint")
+        self.page_hint.setWordWrap(True)
+        workspace_layout.addWidget(self.page_title)
+        workspace_layout.addWidget(self.page_hint)
+
+        self.page_stack = QStackedWidget()
+        workspace_layout.addWidget(self.page_stack, 1)
+        workspace_layout.addWidget(self.status)
+
+        pages = [
+            ("总览", "账户、风险、自选雷达和持仓快照。", self._overview_tab),
+            ("行情交易", "自选股行情、限价委托和未成交订单。", self._market_tab),
+            ("持仓", "持仓买卖、加仓减仓和清仓入口。", self._position_tab),
+            ("AI 工作台", "外部 AI 多智能体分析、候选指令、报告中心和审批入口。", self._agent_tab),
+            ("复盘", "持仓复盘、账户曲线、操作者表现和交易质量。", self._review_workspace_tab),
+            ("日志", "交易记录与 AI 托管日志。", self._log_workspace_tab),
+            ("AI 设置", "OpenAI-compatible API、Codex JSON 指令和模型配置。", self._ai_tab),
+        ]
+        self.nav_meta: list[dict[str, str]] = []
+        for label, hint, factory in pages:
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, hint)
+            item.setTextAlignment(Qt.AlignVCenter)
+            self.nav_list.addItem(item)
+            self.page_stack.addWidget(factory())
+            self.nav_meta.append({"label": label, "hint": hint})
+        self.nav_list.currentRowChanged.connect(self.change_page)
+        self.nav_list.setCurrentRow(0)
+
+        shell.addWidget(nav_panel)
+        shell.addWidget(workspace, 1)
         self.setCentralWidget(root)
 
         self._style()
+
+    def change_page(self, row: int) -> None:
+        if row < 0 or row >= self.page_stack.count():
+            return
+        self.page_stack.setCurrentIndex(row)
+        meta = self.nav_meta[row]
+        self.page_title.setText(meta["label"])
+        self.page_hint.setText(meta["hint"])
 
     def _overview_tab(self) -> QWidget:
         tab = QScrollArea()
@@ -1663,6 +1729,75 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
         return tab
 
+    def _review_workspace_tab(self) -> QWidget:
+        tab = QScrollArea()
+        tab.setWidgetResizable(True)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        tab.setWidget(content)
+
+        position_title = QLabel("持仓复盘")
+        position_title.setObjectName("SectionTitle")
+        layout.addWidget(position_title)
+        position_page = self._position_analysis_tab()
+        position_page.setMinimumHeight(360)
+        layout.addWidget(position_page, 1)
+
+        account_title = QLabel("账户与交易质量")
+        account_title.setObjectName("SectionTitle")
+        layout.addWidget(account_title)
+        review_page = self._review_tab()
+        review_page.setMinimumHeight(520)
+        layout.addWidget(review_page, 2)
+        return tab
+
+    def _log_workspace_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        trade_box = QGroupBox("交易记录")
+        trade_layout = QVBoxLayout(trade_box)
+        self.trade_table = QTableWidget(0, 9)
+        self.trade_table.setHorizontalHeaderLabels(
+            ["时间", "操作者", "方向", "代码", "名称", "数量", "价格", "金额", "收益/原因"]
+        )
+        self.trade_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.trade_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        trade_layout.addWidget(self.trade_table)
+        layout.addWidget(trade_box, 1)
+
+        ai_box = QGroupBox("AI 托管日志")
+        ai_layout = QVBoxLayout(ai_box)
+        controls = QHBoxLayout()
+        refresh = QPushButton("刷新日志")
+        clear = QPushButton("清空日志")
+        refresh.clicked.connect(self.render_ai_logs)
+        clear.clicked.connect(self.clear_ai_logs)
+        controls.addStretch(1)
+        controls.addWidget(refresh)
+        controls.addWidget(clear)
+        ai_layout.addLayout(controls)
+
+        self.ai_log_table = QTableWidget(0, 8)
+        self.ai_log_table.setHorizontalHeaderLabels(
+            ["时间", "来源", "操作者", "摘要", "提交", "撤单", "改价", "错误"]
+        )
+        self.ai_log_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.ai_log_table.horizontalHeader().setStretchLastSection(True)
+        self.ai_log_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.ai_log_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.ai_log_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.ai_log_table.verticalHeader().setDefaultSectionSize(34)
+        self.ai_log_table.itemSelectionChanged.connect(self.render_selected_ai_log_detail)
+        ai_layout.addWidget(self.ai_log_table, 2)
+
+        self.ai_log_detail = QPlainTextEdit()
+        self.ai_log_detail.setReadOnly(True)
+        self.ai_log_detail.setPlaceholderText("选择一条 AI 托管日志后显示完整输入、风控结果和执行结果。")
+        ai_layout.addWidget(self.ai_log_detail, 1)
+        layout.addWidget(ai_box, 2)
+        return tab
+
     def _trade_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -1681,16 +1816,70 @@ class MainWindow(QMainWindow):
         content = QWidget()
         layout = QVBoxLayout(content)
         tab.setWidget(content)
+
+        pipeline_box = QGroupBox("AI Agent Pipeline")
+        pipeline_layout = QVBoxLayout(pipeline_box)
+        pipeline_hint = QLabel("外部 AI 会读取本地 strategy_context；这里展示 2.0.0 规划中的角色化投研流水线。")
+        pipeline_hint.setWordWrap(True)
+        pipeline_layout.addWidget(pipeline_hint)
+        self.agent_pipeline_table = QTableWidget(0, 5)
+        self.agent_pipeline_table.setHorizontalHeaderLabels(["阶段", "角色", "输入上下文", "结构化输出", "状态"])
+        self.agent_pipeline_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.agent_pipeline_table.horizontalHeader().setStretchLastSection(True)
+        self.agent_pipeline_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.agent_pipeline_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.agent_pipeline_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.agent_pipeline_table.verticalHeader().setDefaultSectionSize(34)
+        pipeline_layout.addWidget(self.agent_pipeline_table)
+        layout.addWidget(pipeline_box)
+
         controls = QHBoxLayout()
         run = QPushButton("生成 AI 分析")
         copy = QPushButton("复制 JSON 指令")
+        load = QPushButton("加载候选到指令框")
+        open_report = QPushButton("打开报告")
         run.clicked.connect(self.generate_agent_report)
         copy.clicked.connect(self.copy_agent_commands)
+        load.clicked.connect(self.load_agent_commands_to_ai_output)
+        open_report.clicked.connect(self.open_selected_agent_report)
         controls.addStretch(1)
         controls.addWidget(run)
         controls.addWidget(copy)
+        controls.addWidget(load)
+        controls.addWidget(open_report)
         layout.addLayout(controls)
 
+        report_box = QGroupBox("报告中心")
+        report_layout = QVBoxLayout(report_box)
+        self.agent_report_table = QTableWidget(0, 5)
+        self.agent_report_table.setHorizontalHeaderLabels(["时间", "来源", "摘要", "候选指令", "Markdown 报告"])
+        self.agent_report_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.agent_report_table.horizontalHeader().setStretchLastSection(True)
+        self.agent_report_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.agent_report_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.agent_report_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.agent_report_table.verticalHeader().setDefaultSectionSize(34)
+        report_layout.addWidget(self.agent_report_table)
+        layout.addWidget(report_box)
+
+        approval_box = QGroupBox("候选指令审批")
+        approval_layout = QVBoxLayout(approval_box)
+        approval_hint = QLabel("AI 只生成候选指令；真正执行仍需用户确认或明确托管授权，并继续通过现金、T+1、每手和风控校验。")
+        approval_hint.setWordWrap(True)
+        approval_layout.addWidget(approval_hint)
+        self.agent_command_table = QTableWidget(0, 6)
+        self.agent_command_table.setHorizontalHeaderLabels(["动作", "代码", "数量", "委托价", "原因", "审批状态"])
+        self.agent_command_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.agent_command_table.horizontalHeader().setStretchLastSection(True)
+        self.agent_command_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.agent_command_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.agent_command_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.agent_command_table.verticalHeader().setDefaultSectionSize(34)
+        approval_layout.addWidget(self.agent_command_table)
+        layout.addWidget(approval_box)
+
+        result_box = QGroupBox("角色分析")
+        result_layout = QVBoxLayout(result_box)
         self.agent_table = QTableWidget(0, 5)
         self.agent_table.setHorizontalHeaderLabels(["角色", "观点", "摘要", "关注", "建议动作"])
         self.agent_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
@@ -1709,14 +1898,15 @@ class MainWindow(QMainWindow):
         agent_table_height = 38 * 4 + self.agent_table.horizontalHeader().height() + 18
         self.agent_table.setMinimumHeight(agent_table_height)
         self.agent_table.itemSelectionChanged.connect(self.render_selected_agent_detail)
-        layout.addWidget(self.agent_table, 2)
+        result_layout.addWidget(self.agent_table, 2)
 
         self.agent_detail = QPlainTextEdit()
         self.agent_detail.setReadOnly(True)
         self.agent_detail.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.agent_detail.setMinimumHeight(180)
         self.agent_detail.setPlaceholderText("配置 API 后生成 AI 多智能体分析；选择一个代理可查看完整依据、风险点和 JSON 指令草案。")
-        layout.addWidget(self.agent_detail, 1)
+        result_layout.addWidget(self.agent_detail, 1)
+        layout.addWidget(result_box, 2)
         return tab
 
     def _ai_log_tab(self) -> QWidget:
@@ -1839,6 +2029,16 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(
             """
             QMainWindow { background: #f7f8fa; }
+            #NavPanel { background: #202833; border-right: 1px solid #131820; }
+            #BrandTitle { color: #ffffff; font-size: 19px; font-weight: 700; }
+            #BrandSubtitle { color: #aeb8c6; font-size: 12px; }
+            #MainNav { background: transparent; border: 0; color: #dfe6ee; font-size: 14px; }
+            #MainNav::item { padding: 10px 9px; border-radius: 5px; }
+            #MainNav::item:selected { background: #2f80ed; color: #ffffff; }
+            #MainNav::item:hover { background: #344255; }
+            #PageTitle { font-size: 20px; font-weight: 700; color: #17202a; }
+            #PageHint { color: #697386; font-size: 13px; }
+            #SectionTitle { font-size: 16px; font-weight: 700; color: #17202a; margin-top: 8px; }
             QGroupBox { font-weight: 600; border: 1px solid #d6dae0; border-radius: 6px; margin-top: 12px; padding: 10px; background: #ffffff; }
             QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
             QTableWidget { background: #ffffff; border: 1px solid #d6dae0; gridline-color: #edf0f3; }
@@ -2236,6 +2436,9 @@ class MainWindow(QMainWindow):
         self.render_pending_orders()
         self.render_trades()
         self.render_agent_report()
+        self.render_agent_pipeline()
+        self.render_agent_report_center()
+        self.render_agent_commands()
         self.render_ai_logs()
 
     def overview_risk_summary(self, positions: dict[str, dict[str, Any]], summary: dict[str, float]) -> tuple[str, float]:
@@ -3305,6 +3508,75 @@ class MainWindow(QMainWindow):
                         item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         if report:
             self.agent_detail.setPlainText(json.dumps(report, ensure_ascii=False, indent=2))
+        self.render_agent_report_center()
+        self.render_agent_commands(report)
+
+    def render_agent_pipeline(self) -> None:
+        if not hasattr(self, "agent_pipeline_table"):
+            return
+        report = self.store.latest_agent_report() or {}
+        roles = {str(agent.get("role") or "") for agent in (report.get("agents") or []) if isinstance(agent, dict)}
+        rows = [
+            ("1", "技术面分析师", "价格、趋势、RSI、交易时段", "技术观点、关键价位、风险点"),
+            ("2", "资金流分析师", "A 股主力资金流、涨跌幅、成交状态", "资金情绪、背离提示"),
+            ("3", "新闻/情绪分析师", "预留：新闻、公告、舆情、行业事件", "催化剂、情绪风险"),
+            ("4", "风险经理", "仓位、现金、冻结资金、T+1、每手规则", "风控结论、拦截原因"),
+            ("5", "组合经理", "所有角色结论、账户目标、候选订单", "组合建议、候选 JSON 指令"),
+        ]
+        self.agent_pipeline_table.setRowCount(len(rows))
+        for row, values in enumerate(rows):
+            role = values[1]
+            matched = any(role[:2] in existing or existing[:2] in role for existing in roles)
+            status = "已生成" if matched else "等待 AI 输出"
+            self._set_row(self.agent_pipeline_table, row, [*values, status], 1.0 if matched else 0.0)
+
+    def render_agent_report_center(self) -> None:
+        if not hasattr(self, "agent_report_table"):
+            return
+        reports = [item for item in reversed(self.store.data.get("agent_reports") or []) if isinstance(item, dict)][:80]
+        self.agent_report_table.setRowCount(len(reports))
+        for row, report in enumerate(reports):
+            commands = report.get("commands") if isinstance(report.get("commands"), list) else []
+            path = str(report.get("markdown_report") or "")
+            values = [
+                str(report.get("time") or ""),
+                str(report.get("source") or "AI"),
+                str(report.get("summary") or ""),
+                str(len(commands)),
+                os.path.basename(path) if path else "-",
+            ]
+            self._set_row(self.agent_report_table, row, values, 0.0)
+            for col in range(self.agent_report_table.columnCount()):
+                item = self.agent_report_table.item(row, col)
+                if item:
+                    item.setData(Qt.UserRole, path)
+                    if col == 2:
+                        item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
+    def render_agent_commands(self, report: dict[str, Any] | None = None) -> None:
+        if not hasattr(self, "agent_command_table"):
+            return
+        report = report or self.store.latest_agent_report() or {}
+        commands = report.get("commands") if isinstance(report.get("commands"), list) else []
+        self.agent_command_table.setRowCount(len(commands))
+        for row, command in enumerate(commands):
+            if not isinstance(command, dict):
+                continue
+            action = str(command.get("action") or "hold").lower()
+            status = "无需执行" if action == "hold" else "待用户确认"
+            values = [
+                action,
+                str(command.get("code") or ""),
+                str(command.get("qty") or ""),
+                str(command.get("limit_price") or ""),
+                str(command.get("reason") or ""),
+                status,
+            ]
+            self._set_row(self.agent_command_table, row, values, 0.0)
+            for col in range(self.agent_command_table.columnCount()):
+                item = self.agent_command_table.item(row, col)
+                if item and col == 4:
+                    item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
     def render_selected_agent_detail(self) -> None:
         if not hasattr(self, "agent_table") or not hasattr(self, "agent_detail"):
@@ -3328,6 +3600,34 @@ class MainWindow(QMainWindow):
         commands = report.get("commands") or []
         QApplication.clipboard().setText(json.dumps(commands, ensure_ascii=False, indent=2))
         self.status.setText("已复制组合经理候选 JSON 指令")
+
+    def load_agent_commands_to_ai_output(self) -> None:
+        report = self.store.latest_agent_report()
+        if not report:
+            self.status.setText("暂无候选指令，请先生成 AI 分析。")
+            return
+        commands = report.get("commands") or []
+        if not hasattr(self, "ai_output"):
+            self.status.setText("AI 指令框尚未初始化。")
+            return
+        self.ai_output.setPlainText(json.dumps(commands, ensure_ascii=False, indent=2))
+        self.status.setText("已将候选 JSON 指令加载到 AI 设置页，可继续人工检查后执行。")
+
+    def open_selected_agent_report(self) -> None:
+        path = ""
+        if hasattr(self, "agent_report_table"):
+            row = self.agent_report_table.currentRow()
+            if row >= 0:
+                item = self.agent_report_table.item(row, 0)
+                path = str(item.data(Qt.UserRole) or "") if item else ""
+        if not path:
+            report = self.store.latest_agent_report() or {}
+            path = str(report.get("markdown_report") or "")
+        if path and os.path.exists(path):
+            os.startfile(path)
+            self.status.setText(f"已打开 AI Markdown 报告：{path}")
+        else:
+            self.status.setText("暂无可打开的 Markdown 报告。")
 
     def render_ai_logs(self) -> None:
         if not hasattr(self, "ai_log_table"):
