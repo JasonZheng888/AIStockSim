@@ -1059,9 +1059,20 @@ class MainWindow(QMainWindow):
         self.pending_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.pending_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.pending_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.pending_table.verticalHeader().setDefaultSectionSize(34)
+        pending_table_height = 34 * 5 + self.pending_table.horizontalHeader().height() + 18
+        self.pending_table.setMinimumHeight(pending_table_height)
         pending_layout.addWidget(self.pending_table)
-        pending_box.setMinimumHeight(150)
-        layout.addWidget(pending_box, 1)
+        pending_margins = pending_layout.contentsMargins()
+        pending_box.setMinimumHeight(
+            pending_table_height
+            + cancel_pending.sizeHint().height()
+            + pending_layout.spacing()
+            + pending_margins.top()
+            + pending_margins.bottom()
+            + 24
+        )
+        layout.addWidget(pending_box, 2)
         return tab
 
     def _position_tab(self) -> QWidget:
