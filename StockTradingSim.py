@@ -50,7 +50,7 @@ from PySide6.QtWidgets import (
 
 
 APP_NAME = "StockTradingSim"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 DISPLAY_NAME = "AIStockSim - AI模拟炒股及摸鱼盯盘工具"
 CONFIG_DIR = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~"), APP_NAME)
 CONFIG_FILE = os.path.join(CONFIG_DIR, "portfolio.json")
@@ -859,6 +859,23 @@ class PortfolioStore:
         self.data["watchlist"] = [c for c in self.watchlist if c != code]
         self.save()
 
+    def move_watch(self, code: str, delta: int) -> int | None:
+        norm = normalize_code(code)
+        if not norm:
+            return None
+        items = self.watchlist
+        if norm not in items:
+            return None
+        old_index = items.index(norm)
+        new_index = max(0, min(len(items) - 1, old_index + int(delta)))
+        if new_index == old_index:
+            return old_index
+        item = items.pop(old_index)
+        items.insert(new_index, item)
+        self.data["watchlist"] = items
+        self.save()
+        return new_index
+
     def board_lot(self, code: str) -> int:
         if not code.startswith("hk"):
             return 100
@@ -1295,6 +1312,7 @@ class MainSettingsDialog(LegacyStockWidget.SettingsDialog):
         self._insert_refresh_group_into_general()
         self._insert_risk_tab()
         self._rename_global_hotkey_label()
+        self._configure_lazy_appearance_sliders()
 
         self.tabs.setTabText(0, "常规")
         self.tabs.setTabText(1, "风控")
@@ -1418,6 +1436,21 @@ class MainSettingsDialog(LegacyStockWidget.SettingsDialog):
             if label.text() == "隐藏/显示浮窗：":
                 label.setText("显示/隐藏当前界面：")
                 break
+
+    def _configure_lazy_appearance_sliders(self) -> None:
+        slider_specs = [
+            ("slider_bg_alpha", "lbl_bg_alpha", lambda v: f"{v}%"),
+            ("slider_win_opacity", "lbl_win_opacity", lambda v: f"{v}%"),
+            ("slider_font", "lbl_font", lambda v: f"{v} pt"),
+            ("slider_line", "lbl_line", lambda v: f"+{v} px"),
+        ]
+        for slider_name, label_name, formatter in slider_specs:
+            slider = getattr(self, slider_name, None)
+            label = getattr(self, label_name, None)
+            if slider is None or label is None:
+                continue
+            slider.setTracking(False)
+            slider.sliderMoved.connect(lambda value, lbl=label, fmt=formatter: lbl.setText(fmt(value)))
 
     def _on_global_interval_changed(self, _idx: int) -> None:
         seconds = self.global_interval_combo.currentData()
@@ -1800,11 +1833,17 @@ class MainWindow(QMainWindow):
         self.code_input.setPlaceholderText("输入代码：600000 / sh688001 / hk01810")
         add_btn = QPushButton("加入自选")
         remove_btn = QPushButton("移除选中")
+        move_up_btn = QPushButton("上移")
+        move_down_btn = QPushButton("下移")
         add_btn.clicked.connect(self.add_watch)
         remove_btn.clicked.connect(self.remove_selected_watch)
+        move_up_btn.clicked.connect(lambda: self.move_selected_watch(-1))
+        move_down_btn.clicked.connect(lambda: self.move_selected_watch(1))
         controls.addWidget(self.code_input, 1)
         controls.addWidget(add_btn)
         controls.addWidget(remove_btn)
+        controls.addWidget(move_up_btn)
+        controls.addWidget(move_down_btn)
         layout.addLayout(controls)
 
         self.market_table = QTableWidget(0, 12)
@@ -2721,7 +2760,7 @@ class MainWindow(QMainWindow):
             cfg.setdefault("price_visible", True)
             cfg.setdefault("change_pct_visible", True)
             self.compact_window = LegacyCompactWindow(self, cfg)
-            self.compact_window.set_on_change(self.save_compact_config)
+            self.compact_window.set_on_change(lambda: self.save_compact_config(refresh_quotes=False))
             self.compact_window.set_open_settings_callback(self.open_main_settings)
             return True
         return False
@@ -2818,6 +2857,23 @@ class MainWindow(QMainWindow):
         self.store.remove_watch(code)
         self.sync_compact_watchlist(show_all=True)
         self.refresh_quotes()
+
+    def move_selected_watch(self, delta: int) -> None:
+        code = self.selected_market_code()
+        if not code:
+            return
+        new_row = self.store.move_watch(code, delta)
+        if new_row is None:
+            return
+        self.sync_compact_watchlist(show_all=True)
+        self.render_market()
+        self.render_overview()
+        self.render_strategy_workspace()
+        self.write_codex_snapshot()
+        if self.market_table.rowCount():
+            self.market_table.selectRow(max(0, min(new_row, self.market_table.rowCount() - 1)))
+        direction = "上移" if delta < 0 else "下移"
+        self.status.setText(f"自选股已{direction}：{code}")
 
     def reset_account(self) -> None:
         dialog = InitialCapitalDialog(self)
