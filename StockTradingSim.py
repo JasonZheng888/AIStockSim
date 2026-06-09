@@ -50,7 +50,7 @@ from PySide6.QtWidgets import (
 
 
 APP_NAME = "StockTradingSim"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.2.1"
 DISPLAY_NAME = "AIStockSim - AI模拟炒股及摸鱼盯盘工具"
 CONFIG_DIR = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~"), APP_NAME)
 CONFIG_FILE = os.path.join(CONFIG_DIR, "portfolio.json")
@@ -465,20 +465,18 @@ class QuoteService:
                 if len(parts) < 2:
                     continue
                 numeric = [self._to_float(part) for part in parts[1:]]
-                price = numeric[0] if numeric else 0.0
+                if len(numeric) >= 7:
+                    price = numeric[1]
+                    volume = numeric[4]
+                    amount = numeric[5]
+                    avg_price = numeric[6]
+                else:
+                    price = numeric[0] if numeric else 0.0
+                    avg_price = numeric[1] if len(numeric) >= 2 else 0.0
+                    volume = numeric[2] if len(numeric) >= 3 else 0.0
+                    amount = numeric[3] if len(numeric) >= 4 else 0.0
                 if price <= 0:
                     continue
-                avg_price = 0.0
-                volume = 0.0
-                amount = 0.0
-                if len(numeric) >= 5:
-                    # trends2 字段在不同证券上偶有差异，保守取可识别的价格/均价/量额。
-                    avg_price = numeric[1] if 0 < numeric[1] < price * 3 else numeric[3]
-                    volume = numeric[2] if numeric[2] >= 0 else 0.0
-                    amount = numeric[3] if numeric[3] >= 0 and numeric[3] != avg_price else numeric[4]
-                elif len(numeric) >= 3:
-                    avg_price = numeric[1]
-                    volume = numeric[2]
                 if avg_price <= 0:
                     avg_price = price
                 rows.append(
@@ -3537,6 +3535,12 @@ class MainWindow(QMainWindow):
             "trend": str(profile.get("trend") or "-"),
         }
 
+    @staticmethod
+    def _is_plausible_intraday_price(value: float, reference: float) -> bool:
+        if value <= 0 or reference <= 0:
+            return False
+        return reference * 0.5 <= value <= reference * 1.5
+
     def intraday_profile(self, code: str) -> dict[str, Any]:
         norm = normalize_code(code) or code
         rows = self.intraday_cache.get(norm) or []
@@ -3547,10 +3551,35 @@ class MainWindow(QMainWindow):
             return {"status": "分时采样中", "code": norm, "sample_count": len(rows)}
         latest = rows[-1]
         latest_price = float(latest.price)
-        avg_price = float(latest.avg_price or 0) or self.avg([float(item.avg_price) for item in rows if item.avg_price > 0]) or latest_price
+        avg_candidates = [float(item.avg_price) for item in rows if item.avg_price > 0]
+        latest_avg = float(latest.avg_price or 0)
+        avg_price = latest_avg if self._is_plausible_intraday_price(latest_avg, latest_price) else 0.0
+        avg_price_source = "接口均价线" if avg_price > 0 else ""
+        if avg_price <= 0:
+            avg_price = self.avg([value for value in avg_candidates if self._is_plausible_intraday_price(value, latest_price)])
+            if avg_price > 0:
+                avg_price_source = "均价线均值"
+        if avg_price <= 0:
+            avg_price = latest_price
+            avg_price_source = "现价兜底"
         total_volume = sum(max(0.0, float(item.volume)) for item in rows)
         total_amount = sum(max(0.0, float(item.amount)) for item in rows)
-        vwap = total_amount / total_volume if total_volume > 0 and total_amount > 0 else avg_price
+        derived_candidates: list[float] = []
+        if total_volume > 0 and total_amount > 0:
+            derived_candidates.extend([total_amount / total_volume, total_amount / (total_volume * 100)])
+        plausible_derived = [
+            value for value in derived_candidates
+            if self._is_plausible_intraday_price(value, latest_price)
+        ]
+        if avg_price > 0 and avg_price_source != "现价兜底":
+            vwap = avg_price
+            vwap_source = avg_price_source
+        elif plausible_derived:
+            vwap = min(plausible_derived, key=lambda value: abs(value - latest_price))
+            vwap_source = "成交额/成交量估算"
+        else:
+            vwap = latest_price
+            vwap_source = "现价兜底"
 
         def window_return(size: int) -> float | None:
             if len(prices) <= size or prices[-size - 1] <= 0:
@@ -3594,6 +3623,7 @@ class MainWindow(QMainWindow):
             "latest_price": round(latest_price, 4),
             "avg_price": round(avg_price, 4),
             "vwap": round(vwap, 4) if vwap else None,
+            "vwap_source": vwap_source,
             "above_vwap": above_vwap,
             "above_avg_price": above_avg,
             "return_5m": round(ret_5, 2) if ret_5 is not None else None,
