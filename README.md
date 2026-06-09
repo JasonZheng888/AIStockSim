@@ -1,9 +1,9 @@
 
 # AIStockSim - AI模拟炒股及摸鱼盯盘工具
 
-当前版本：`2.0.0`
+当前版本：`2.0.1`
 
-> `2.0.0` 把 AIStockSim 从表格型模拟盘升级为 AI 模拟交易工作台，保留单文件 exe、A 股/港股行情、模拟交易和盯盘模式。
+> `2.0.1` 在 2.0 工作台基础上补强 Codex 文件桥，软件运行时可自动读取本地指令、执行模拟委托并回写结果，方便托管操盘。
 
 一个面向 Windows 的轻量 AI 模拟炒股及摸鱼盯盘工具：既能像透明盯盘小窗一样贴在屏幕角落看盘，也能在主界面里用真实行情练习虚拟买卖、复盘持仓、比较自己和 AI/Codex 的模拟操作。
 
@@ -29,6 +29,7 @@
 * **组合再平衡建议**：本地规则会把仓位集中、现金不足、ST 风险、T+1 和活动委托转成组合经理可参考的调整提示。
 * **主界面 + 盯盘模式**：主界面做模拟交易，盯盘模式复用透明浮窗能力，支持拖动、右键指标开关、颜色、字体、K 线和设置面板。
 * **AI/Codex 指令接入**：外部 AI 可生成 JSON 限价委托、撤单和改价；Codex 也可通过本地 JSON 文件接管模拟操作。
+* **Codex 文件桥**：运行中自动读取 `codex_orders.json`，执行后写入 `codex_result.json` 并清空指令；同时持续导出 `codex_snapshot.json` 供 Codex 分析账户状态。
 * **AI 托管日志**：每次 AI 建议、JSON 执行、风控失败和委托撮合都会记录到日志页，便于回看自动化到底做了什么。
 * **总览工作台**：启动后先看账户、风险、自选策略信号、持仓快照和最新多智能体结论，再进入下单或复盘页面。
 * **单文件免安装**：Release 提供打包好的单文件 `StockTradingSim.exe`，Windows 用户下载后可直接双击运行。
@@ -77,6 +78,20 @@ Codex 本地指令文件：
 ```text
 %APPDATA%\StockTradingSim\codex_orders.json
 ```
+
+Codex 账户快照文件：
+
+```text
+%APPDATA%\StockTradingSim\codex_snapshot.json
+```
+
+Codex 执行结果文件：
+
+```text
+%APPDATA%\StockTradingSim\codex_result.json
+```
+
+软件运行时会自动轮询 `codex_orders.json`。Codex 或其它自动化只需要读取 `codex_snapshot.json`，写入 `codex_orders.json`，软件就会按模拟盘规则执行，随后把结果写入 `codex_result.json` 并清空指令文件，避免重复下单。
 
 这些文件包含模拟账户、交易记录和 AI 配置等个人数据。公开分享截图、压缩包或反馈问题时，请避免附带真实账户配置文件。
 

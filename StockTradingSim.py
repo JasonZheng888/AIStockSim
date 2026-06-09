@@ -50,11 +50,13 @@ from PySide6.QtWidgets import (
 
 
 APP_NAME = "StockTradingSim"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 DISPLAY_NAME = "AIStockSim - AI模拟炒股及摸鱼盯盘工具"
 CONFIG_DIR = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~"), APP_NAME)
 CONFIG_FILE = os.path.join(CONFIG_DIR, "portfolio.json")
 CODEX_ORDER_FILE = os.path.join(CONFIG_DIR, "codex_orders.json")
+CODEX_SNAPSHOT_FILE = os.path.join(CONFIG_DIR, "codex_snapshot.json")
+CODEX_RESULT_FILE = os.path.join(CONFIG_DIR, "codex_result.json")
 TRADING_CALENDAR_FILE = os.path.join(CONFIG_DIR, "trading_calendar.json")
 COMPACT_CONFIG_FILE = os.path.join(CONFIG_DIR, "compact_config.json")
 ICON_FILE = "StockWidget.ico"
@@ -1422,6 +1424,7 @@ class MainWindow(QMainWindow):
         self._compact_top_timer_was_active = False
         self._closing = False
         self._app_icon_choice = load_compact_config().get("app_icon")
+        self._codex_order_mtime = 0.0
 
         self._build_ui()
         self._build_tray()
@@ -1431,6 +1434,9 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(lambda: self.refresh_quotes(auto=True))
         self.timer.start(self.store.refresh_seconds * 1000)
+        self.codex_timer = QTimer(self)
+        self.codex_timer.timeout.connect(self.poll_codex_orders)
+        self.codex_timer.start(1500)
         self.refresh_quotes(auto=True)
         QTimer.singleShot(800, self.preload_compact_window)
 
@@ -2317,7 +2323,10 @@ class MainWindow(QMainWindow):
             '[{"action":"buy","code":"hk01810","qty":200,"limit_price":28.0,"reason":"回调到目标价后模拟买入"},\n'
             ' {"action":"amend","code":"sh600000","side":"sell","limit_price":12.8,"reason":"调整旧卖单"},\n'
             ' {"action":"cancel","code":"sh600000","side":"sell","reason":"取消旧委托"}]\n\n'
-            f"Codex 本地指令文件：{CODEX_ORDER_FILE}"
+            f"Codex 本地指令文件：{CODEX_ORDER_FILE}\n"
+            f"Codex 账户快照文件：{CODEX_SNAPSHOT_FILE}\n"
+            f"Codex 执行结果文件：{CODEX_RESULT_FILE}\n"
+            "软件运行时会自动轮询本地指令文件，执行后写入结果并清空指令文件。"
         )
         layout.addWidget(self.ai_output, 1)
         return tab
@@ -2783,6 +2792,7 @@ class MainWindow(QMainWindow):
         self.render_rebalance_suggestions()
         self.render_agent_chat()
         self.render_ai_logs()
+        self.write_codex_snapshot()
 
     def overview_risk_summary(self, positions: dict[str, dict[str, Any]], summary: dict[str, float]) -> tuple[str, float]:
         warnings: list[str] = []
@@ -5079,7 +5089,71 @@ class MainWindow(QMainWindow):
         self.ai_output.setPlainText(text)
         self.status.setText(f"已加载 Codex 指令：{CODEX_ORDER_FILE}")
 
-    def execute_ai_orders(self, text: str, operator: str) -> None:
+    def write_codex_snapshot(self) -> None:
+        try:
+            snapshot = self.account_snapshot()
+            snapshot["app"] = {"name": APP_NAME, "version": APP_VERSION}
+            snapshot["codex_bridge"] = {
+                "orders_file": CODEX_ORDER_FILE,
+                "snapshot_file": CODEX_SNAPSHOT_FILE,
+                "result_file": CODEX_RESULT_FILE,
+                "polling": True,
+                "schema": snapshot.get("codex_order_schema"),
+            }
+            save_json(CODEX_SNAPSHOT_FILE, snapshot)
+        except Exception:
+            return
+
+    def poll_codex_orders(self) -> None:
+        if self._closing:
+            return
+        ensure_config_dir()
+        if not os.path.exists(CODEX_ORDER_FILE):
+            return
+        try:
+            mtime = os.path.getmtime(CODEX_ORDER_FILE)
+            if mtime <= self._codex_order_mtime:
+                return
+            self._codex_order_mtime = mtime
+            data = load_json(CODEX_ORDER_FILE, [])
+            orders = data.get("orders") if isinstance(data, dict) else data
+            if not isinstance(orders, list) or not orders:
+                return
+            actionable = [item for item in orders if isinstance(item, dict) and str(item.get("action") or "hold").lower() != "hold"]
+            if not actionable:
+                save_json(CODEX_RESULT_FILE, {"time": now_str(), "source": "Codex 本地指令", "summary": "没有可执行指令", "orders": orders})
+                save_json(CODEX_ORDER_FILE, [])
+                self._codex_order_mtime = os.path.getmtime(CODEX_ORDER_FILE)
+                return
+            request_id = str(data.get("request_id") or data.get("id") or now_str()) if isinstance(data, dict) else now_str()
+            result = self.execute_ai_orders(json.dumps(orders, ensure_ascii=False), "Codex", show_dialog=False)
+            save_json(
+                CODEX_RESULT_FILE,
+                {
+                    "time": now_str(),
+                    "request_id": request_id,
+                    "source": "Codex 本地指令",
+                    "result": result,
+                    "orders": orders,
+                    "snapshot_file": CODEX_SNAPSHOT_FILE,
+                },
+            )
+            save_json(CODEX_ORDER_FILE, [])
+            self._codex_order_mtime = os.path.getmtime(CODEX_ORDER_FILE)
+            self.status.setText(f"已执行 Codex 本地指令：{(result or {}).get('message', '')}")
+        except Exception as exc:
+            save_json(
+                CODEX_RESULT_FILE,
+                {
+                    "time": now_str(),
+                    "source": "Codex 本地指令",
+                    "error": str(exc),
+                    "snapshot_file": CODEX_SNAPSHOT_FILE,
+                },
+            )
+            self.status.setText(f"Codex 本地指令执行失败：{exc}")
+
+    def execute_ai_orders(self, text: str, operator: str, show_dialog: bool = True) -> dict[str, Any]:
         try:
             orders = json.loads(text)
             if isinstance(orders, dict):
@@ -5101,8 +5175,9 @@ class MainWindow(QMainWindow):
                 }
             )
             self.render_ai_logs()
-            QMessageBox.warning(self, "JSON 无效", str(exc))
-            return
+            if show_dialog:
+                QMessageBox.warning(self, "JSON 无效", str(exc))
+            return {"submitted": 0, "cancelled": 0, "amended": 0, "filled": 0, "errors": [str(exc)], "message": f"JSON 解析失败：{exc}"}
 
         submitted = 0
         cancelled = 0
@@ -5229,7 +5304,16 @@ class MainWindow(QMainWindow):
             }
         )
         self.render_ai_logs()
-        QMessageBox.information(self, "AI 执行结果", message)
+        if show_dialog:
+            QMessageBox.information(self, "AI 执行结果", message)
+        return {
+            "submitted": submitted,
+            "cancelled": cancelled,
+            "amended": updated,
+            "filled": executed,
+            "errors": errors,
+            "message": message,
+        }
 
 
 def main() -> int:
