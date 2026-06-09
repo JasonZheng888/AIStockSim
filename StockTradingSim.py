@@ -50,13 +50,14 @@ from PySide6.QtWidgets import (
 
 
 APP_NAME = "StockTradingSim"
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.1.0"
 DISPLAY_NAME = "AIStockSim - AI模拟炒股及摸鱼盯盘工具"
 CONFIG_DIR = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~"), APP_NAME)
 CONFIG_FILE = os.path.join(CONFIG_DIR, "portfolio.json")
 CODEX_ORDER_FILE = os.path.join(CONFIG_DIR, "codex_orders.json")
 CODEX_SNAPSHOT_FILE = os.path.join(CONFIG_DIR, "codex_snapshot.json")
 CODEX_RESULT_FILE = os.path.join(CONFIG_DIR, "codex_result.json")
+CODEX_KLINE_FILE = os.path.join(CONFIG_DIR, "codex_kline_history.json")
 TRADING_CALENDAR_FILE = os.path.join(CONFIG_DIR, "trading_calendar.json")
 COMPACT_CONFIG_FILE = os.path.join(CONFIG_DIR, "compact_config.json")
 ICON_FILE = "StockWidget.ico"
@@ -324,10 +325,29 @@ class MoneyFlow:
     source: str
 
 
+@dataclass
+class DailyKLine:
+    code: str
+    date: str
+    open: float
+    close: float
+    high: float
+    low: float
+    volume: float
+    amount: float
+    amplitude: float
+    change_pct: float
+    change: float
+    turnover: float
+    source: str
+
+
 def eastmoney_secid(code: str) -> str | None:
     norm = normalize_code(code)
-    if not norm or norm.startswith("hk"):
+    if not norm:
         return None
+    if norm.startswith("hk"):
+        return "116." + norm[2:].zfill(5)
     market = "1" if norm.startswith("sh") else "0"
     return market + "." + norm[-6:]
 
@@ -375,9 +395,75 @@ class QuoteService:
                 flows[code] = flow
         return flows
 
+    def fetch_daily_klines(self, codes: list[str], limit: int = 1000000) -> dict[str, list[DailyKLine]]:
+        out: dict[str, list[DailyKLine]] = {}
+        requested: list[str] = []
+        for code in codes:
+            norm = normalize_code(code)
+            if norm and norm not in requested:
+                requested.append(norm)
+        for code in requested:
+            rows = self._fetch_daily_kline(code, limit=limit)
+            if rows:
+                out[code] = rows
+        return out
+
+    def _fetch_daily_kline(self, code: str, limit: int = 1000000) -> list[DailyKLine]:
+        secid = eastmoney_secid(code)
+        norm = normalize_code(code) or code
+        if not secid:
+            return []
+        try:
+            resp = self.session.get(
+                "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+                params={
+                    "secid": secid,
+                    "klt": "101",
+                    "fqt": "1",
+                    "lmt": str(limit),
+                    "end": "20500101",
+                    "fields1": "f1,f2,f3,f4,f5,f6",
+                    "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                    "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+                },
+                timeout=8,
+            )
+            payload = resp.json()
+            data = (payload or {}).get("data") or {}
+            klines = data.get("klines") or []
+            rows: list[DailyKLine] = []
+            for raw in klines:
+                parts = str(raw).split(",")
+                if len(parts) < 11:
+                    continue
+                close = self._to_float(parts[2])
+                if close <= 0:
+                    continue
+                rows.append(
+                    DailyKLine(
+                        code=norm,
+                        date=parts[0],
+                        open=self._to_float(parts[1]),
+                        close=close,
+                        high=self._to_float(parts[3]),
+                        low=self._to_float(parts[4]),
+                        volume=self._to_float(parts[5]),
+                        amount=self._to_float(parts[6]),
+                        amplitude=self._to_float(parts[7]),
+                        change_pct=self._to_float(parts[8]),
+                        change=self._to_float(parts[9]),
+                        turnover=self._to_float(parts[10]),
+                        source="东方财富日K",
+                    )
+                )
+            return rows
+        except Exception:
+            return []
+
     def _fetch_money_flow(self, code: str) -> MoneyFlow | None:
         secid = eastmoney_secid(code)
-        if not secid:
+        norm = normalize_code(code) or ""
+        if not secid or norm.startswith("hk"):
             return None
         try:
             resp = self.session.get(
@@ -1413,7 +1499,9 @@ class MainWindow(QMainWindow):
         self.quotes = QuoteService()
         self.quote_cache: dict[str, Quote] = {}
         self.money_flow_cache: dict[str, MoneyFlow] = {}
+        self.daily_kline_cache: dict[str, list[DailyKLine]] = {}
         self._money_flow_last_fetch: dt.datetime | None = None
+        self._daily_kline_last_fetch: dt.datetime | None = None
         self.price_history: dict[str, list[tuple[str, float]]] = {}
         self.compact_window: LegacyCompactWindow | None = None
         self._settings_dialog = None
@@ -2004,9 +2092,9 @@ class MainWindow(QMainWindow):
         matrix_hint = QLabel("矩阵按自选股和持仓合并展示，便于对比趋势、RSI、资金流、仓位风险和未成交委托。")
         matrix_hint.setWordWrap(True)
         matrix_layout.addWidget(matrix_hint)
-        self.strategy_signal_table = QTableWidget(0, 10)
+        self.strategy_signal_table = QTableWidget(0, 17)
         self.strategy_signal_table.setHorizontalHeaderLabels(
-            ["代码", "名称", "最新价", "涨跌幅", "趋势", "RSI", "资金流", "风控", "仓位", "活动委托"]
+            ["代码", "名称", "最新价", "涨跌幅", "K线样本", "趋势", "均线", "RSI", "MACD", "KDJ", "量能", "支撑", "压力", "资金流", "风控", "仓位", "活动委托"]
         )
         self.strategy_signal_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.strategy_signal_table.horizontalHeader().setStretchLastSection(True)
@@ -2745,6 +2833,7 @@ class MainWindow(QMainWindow):
             self.quote_cache.update(fetched)
             self.record_price_history(fetched)
             self.refresh_money_flows(codes, force=not auto)
+            self.refresh_daily_klines(codes, force=not auto)
             executed = self.try_execute_pending_orders()
             mode = "自动刷新" if auto else "手动刷新"
             suffix = f"，成交 {executed} 笔委托" if executed else ""
@@ -2772,6 +2861,28 @@ class MainWindow(QMainWindow):
             flows = self.quotes.fetch_money_flows(a_codes)
             if flows:
                 self.money_flow_cache.update(flows)
+        except Exception:
+            return
+
+    def refresh_daily_klines(self, codes: list[str], force: bool = False) -> None:
+        now = dt.datetime.now()
+        if not force and self._daily_kline_last_fetch is not None:
+            if (now - self._daily_kline_last_fetch).total_seconds() < 1800:
+                return
+        requested: list[str] = []
+        for code in codes:
+            norm = normalize_code(code)
+            if norm and norm not in requested:
+                requested.append(norm)
+        requested = requested[:16]
+        if not requested:
+            return
+        self._daily_kline_last_fetch = now
+        try:
+            rows = self.quotes.fetch_daily_klines(requested)
+            if rows:
+                self.daily_kline_cache.update(rows)
+                self.write_codex_kline_history()
         except Exception:
             return
 
@@ -2993,6 +3104,216 @@ class MainWindow(QMainWindow):
             )
         return rows
 
+    def daily_kline_dicts(self, code: str, limit: int | None = None) -> list[dict[str, Any]]:
+        rows = self.daily_kline_cache.get(normalize_code(code) or code) or []
+        selected = rows[-limit:] if limit else rows
+        return [item.__dict__.copy() for item in selected]
+
+    @staticmethod
+    def avg(values: list[float]) -> float:
+        return sum(values) / len(values) if values else 0.0
+
+    def daily_rsi_value(self, closes: list[float], period: int = 14) -> float | None:
+        if len(closes) <= period:
+            return None
+        changes = [closes[i] - closes[i - 1] for i in range(len(closes) - period, len(closes))]
+        gains = [change for change in changes if change > 0]
+        losses = [-change for change in changes if change < 0]
+        avg_gain = sum(gains) / period
+        avg_loss = sum(losses) / period
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return 100 - 100 / (1 + rs)
+
+    def ema_series(self, values: list[float], period: int) -> list[float]:
+        if not values:
+            return []
+        alpha = 2 / (period + 1)
+        out = [float(values[0])]
+        for value in values[1:]:
+            out.append(float(value) * alpha + out[-1] * (1 - alpha))
+        return out
+
+    def macd_profile(self, closes: list[float]) -> dict[str, Any]:
+        if len(closes) < 35:
+            return {"status": "样本不足"}
+        ema12 = self.ema_series(closes, 12)
+        ema26 = self.ema_series(closes, 26)
+        diffs = [a - b for a, b in zip(ema12, ema26)]
+        dea = self.ema_series(diffs, 9)
+        if len(diffs) < 2 or len(dea) < 2:
+            return {"status": "样本不足"}
+        dif = diffs[-1]
+        signal = dea[-1]
+        hist = (dif - signal) * 2
+        prev_dif = diffs[-2]
+        prev_dea = dea[-2]
+        if prev_dif <= prev_dea and dif > signal:
+            label = "金叉"
+        elif prev_dif >= prev_dea and dif < signal:
+            label = "死叉"
+        elif dif > signal:
+            label = "多方区"
+        else:
+            label = "空方区"
+        return {"status": label, "dif": round(dif, 4), "dea": round(signal, 4), "hist": round(hist, 4)}
+
+    def kdj_profile(self, highs: list[float], lows: list[float], closes: list[float], period: int = 9) -> dict[str, Any]:
+        if len(closes) < period:
+            return {"status": "样本不足"}
+        k = 50.0
+        d = 50.0
+        for index in range(len(closes)):
+            start = max(0, index - period + 1)
+            high = max(highs[start : index + 1])
+            low = min(lows[start : index + 1])
+            rsv = 50.0 if high <= low else (closes[index] - low) / (high - low) * 100
+            k = k * 2 / 3 + rsv / 3
+            d = d * 2 / 3 + k / 3
+        j = 3 * k - 2 * d
+        if j >= 100:
+            status = "超买"
+        elif j <= 0:
+            status = "超卖"
+        elif k > d:
+            status = "偏强"
+        else:
+            status = "偏弱"
+        return {"status": status, "k": round(k, 2), "d": round(d, 2), "j": round(j, 2)}
+
+    def technical_profile(self, code: str) -> dict[str, Any]:
+        norm = normalize_code(code) or code
+        rows = self.daily_kline_cache.get(norm) or []
+        if not rows:
+            return {"status": "历史K采样中", "code": norm, "sample_count": 0}
+        closes = [float(item.close) for item in rows if item.close > 0]
+        highs = [float(item.high) for item in rows if item.high > 0]
+        lows = [float(item.low) for item in rows if item.low > 0]
+        volumes = [float(item.volume) for item in rows if item.volume >= 0]
+        if not closes or len(highs) != len(closes) or len(lows) != len(closes):
+            return {"status": "历史K采样中", "code": norm, "sample_count": len(rows)}
+        close = closes[-1]
+        periods = [5, 10, 20, 60, 120, 250]
+        mas = {
+            f"ma{period}": round(self.avg(closes[-period:]), 4) if len(closes) >= period else None
+            for period in periods
+        }
+        ma5 = mas.get("ma5")
+        ma10 = mas.get("ma10")
+        ma20 = mas.get("ma20")
+        ma60 = mas.get("ma60")
+        if ma5 and ma10 and ma20 and ma60 and ma5 > ma10 > ma20 > ma60:
+            ma_status = "多头排列"
+        elif ma5 and ma10 and ma20 and ma60 and ma5 < ma10 < ma20 < ma60:
+            ma_status = "空头排列"
+        elif ma20 and close >= ma20:
+            ma_status = "站上MA20"
+        elif ma20:
+            ma_status = "跌破MA20"
+        else:
+            ma_status = "均线样本不足"
+
+        recent_20 = rows[-20:] if len(rows) >= 20 else rows
+        recent_60 = rows[-60:] if len(rows) >= 60 else rows
+        support_candidates = [float(item.low) for item in recent_60 if 0 < float(item.low) <= close]
+        resistance_candidates = [float(item.high) for item in recent_60 if float(item.high) >= close]
+        support = max(support_candidates) if support_candidates else min(lows[-60:] if len(lows) >= 60 else lows)
+        resistance = min(resistance_candidates) if resistance_candidates else max(highs[-60:] if len(highs) >= 60 else highs)
+        prev = rows[-2] if len(rows) >= 2 else None
+        gap = "无明显缺口"
+        if prev:
+            if rows[-1].low > prev.high:
+                gap = "向上跳空"
+            elif rows[-1].high < prev.low:
+                gap = "向下跳空"
+
+        rsi = self.daily_rsi_value(closes)
+        if rsi is None:
+            rsi_label = "RSI样本不足"
+        elif rsi >= 70:
+            rsi_label = "偏热"
+        elif rsi <= 30:
+            rsi_label = "偏冷"
+        else:
+            rsi_label = "中性"
+        volume_5 = self.avg(volumes[-5:]) if len(volumes) >= 5 else 0.0
+        volume_20 = self.avg(volumes[-20:]) if len(volumes) >= 20 else 0.0
+        volume_ratio = volume_5 / volume_20 if volume_20 else 0.0
+        if volume_ratio >= 1.5:
+            volume_status = "放量"
+        elif volume_ratio and volume_ratio <= 0.7:
+            volume_status = "缩量"
+        else:
+            volume_status = "量能平稳" if volume_ratio else "量能样本不足"
+
+        last_20_return = close / closes[-20] * 100 - 100 if len(closes) >= 20 and closes[-20] else 0.0
+        last_60_return = close / closes[-60] * 100 - 100 if len(closes) >= 60 and closes[-60] else 0.0
+        macd = self.macd_profile(closes)
+        kdj = self.kdj_profile(highs, lows, closes)
+        if ma_status == "多头排列" and macd.get("status") in ("金叉", "多方区"):
+            trend = "日K偏强"
+        elif ma_status == "空头排列" and macd.get("status") in ("死叉", "空方区"):
+            trend = "日K偏弱"
+        elif ma20 and close >= ma20:
+            trend = "日K修复"
+        else:
+            trend = "日K震荡"
+        return {
+            "status": "ok",
+            "code": norm,
+            "sample_count": len(rows),
+            "first_date": rows[0].date,
+            "last_date": rows[-1].date,
+            "last_close": round(close, 4),
+            "ma": mas,
+            "ma_status": ma_status,
+            "rsi14": round(rsi, 2) if rsi is not None else None,
+            "rsi_status": rsi_label,
+            "macd": macd,
+            "kdj": kdj,
+            "volume_ratio_5_20": round(volume_ratio, 3) if volume_ratio else None,
+            "volume_status": volume_status,
+            "support": round(support, 4) if support else None,
+            "resistance": round(resistance, 4) if resistance else None,
+            "high_20": round(max(float(item.high) for item in recent_20), 4) if recent_20 else None,
+            "low_20": round(min(float(item.low) for item in recent_20), 4) if recent_20 else None,
+            "high_60": round(max(float(item.high) for item in recent_60), 4) if recent_60 else None,
+            "low_60": round(min(float(item.low) for item in recent_60), 4) if recent_60 else None,
+            "gap": gap,
+            "return_20": round(last_20_return, 2),
+            "return_60": round(last_60_return, 2),
+            "trend": trend,
+        }
+
+    def technical_signal_texts(self, code: str) -> dict[str, str]:
+        profile = self.technical_profile(code)
+        if profile.get("status") != "ok":
+            return {
+                "sample": str(profile.get("status") or "历史K采样中"),
+                "ma": "-",
+                "rsi": "-",
+                "macd": "-",
+                "kdj": "-",
+                "volume": "-",
+                "support": "-",
+                "resistance": "-",
+                "trend": "历史K采样中",
+            }
+        macd = profile.get("macd") or {}
+        kdj = profile.get("kdj") or {}
+        return {
+            "sample": f"{profile.get('sample_count')}根 / {profile.get('last_date')}",
+            "ma": str(profile.get("ma_status") or "-"),
+            "rsi": f"RSI {profile.get('rsi14')} {profile.get('rsi_status')}",
+            "macd": f"{macd.get('status')} DIF {macd.get('dif')} DEA {macd.get('dea')}",
+            "kdj": f"{kdj.get('status')} K {kdj.get('k')} D {kdj.get('d')} J {kdj.get('j')}",
+            "volume": f"{profile.get('volume_status')} {profile.get('volume_ratio_5_20') or '-'}",
+            "support": str(profile.get("support") or "-"),
+            "resistance": str(profile.get("resistance") or "-"),
+            "trend": str(profile.get("trend") or "-"),
+        }
+
     def strategy_signals(self, code: str, quote: Quote | None) -> tuple[str, str, str]:
         if not quote:
             return "-", "-", self.risk_signal_for_code(code, None)
@@ -3014,7 +3335,11 @@ class MainWindow(QMainWindow):
                 trend = "日内弱势"
             else:
                 trend = "采样中"
-        return trend, self.rsi_signal(prices), self.risk_signal_for_code(code, quote)
+        daily = self.technical_signal_texts(code)
+        if daily.get("trend") and daily["trend"] != "历史K采样中":
+            trend = f"{daily['trend']} / {trend}"
+        rsi_text = daily["rsi"] if daily.get("rsi") and daily["rsi"] != "-" else self.rsi_signal(prices)
+        return trend, rsi_text, self.risk_signal_for_code(code, quote)
 
     def rsi_signal(self, prices: list[float]) -> str:
         if len(prices) < 15:
@@ -3094,6 +3419,8 @@ class MainWindow(QMainWindow):
             trend, rsi, risk = self.strategy_signals(code, quote)
             pending = [order for order in self.store.active_pending_orders() if str(order.get("code") or "") == code]
             flow = self.money_flow_cache.get(code)
+            technical = self.technical_profile(code)
+            technical_text = self.technical_signal_texts(code)
             rows.append(
                 {
                     "code": code,
@@ -3115,6 +3442,8 @@ class MainWindow(QMainWindow):
                     "floating": round((price - float(item.get("breakeven_cost") or price)) * qty, 2) if qty else 0.0,
                     "pending_count": len(pending),
                     "pending": pending,
+                    "technical": technical,
+                    "technical_text": technical_text,
                 }
             )
         return rows
@@ -3124,16 +3453,44 @@ class MainWindow(QMainWindow):
             {
                 "name": "趋势动量",
                 "status": "启用",
-                "inputs": "最近 120 次价格记录",
-                "outputs": "短线上行/下行/震荡",
+                "inputs": "日内价格采样 + 全量历史日K",
+                "outputs": "日K偏强/偏弱/修复/震荡，短线上行/下行",
                 "usage": "strategy_context.market_rows[].trend",
             },
             {
                 "name": "RSI 冷热",
                 "status": "启用",
-                "inputs": "最近价格序列",
-                "outputs": "偏热、偏冷、强势、弱势、中性",
+                "inputs": "历史日K收盘价",
+                "outputs": "RSI14 偏热/偏冷/中性",
                 "usage": "strategy_context.market_rows[].rsi",
+            },
+            {
+                "name": "历史日K全量",
+                "status": "启用",
+                "inputs": "东方财富日K接口返回的全部可用样本",
+                "outputs": "样本数、首末日期、近端结构和完整K线落盘文件",
+                "usage": "strategy_context.market_rows[].technical 和 codex_kline_history.json",
+            },
+            {
+                "name": "均线结构",
+                "status": "启用",
+                "inputs": "MA5/10/20/60/120/250",
+                "outputs": "多头排列、空头排列、站上/跌破 MA20",
+                "usage": "strategy_context.market_rows[].technical.ma_status",
+            },
+            {
+                "name": "支撑压力",
+                "status": "启用",
+                "inputs": "近60日日K高低点",
+                "outputs": "支撑位、压力位、20/60日高低点、缺口",
+                "usage": "strategy_context.market_rows[].technical.support/resistance",
+            },
+            {
+                "name": "MACD/KDJ",
+                "status": "启用",
+                "inputs": "历史日K收盘价和高低点",
+                "outputs": "MACD 金叉/死叉/多空区，KDJ 超买/超卖/强弱",
+                "usage": "strategy_context.market_rows[].technical.macd/kdj",
             },
             {
                 "name": "A 股资金流",
@@ -3785,20 +4142,28 @@ class MainWindow(QMainWindow):
         self.strategy_signal_table.setRowCount(len(rows))
         for row, item in enumerate(rows):
             sign = float(item.get("change_pct") or 0)
+            technical_text = item.get("technical_text") if isinstance(item.get("technical_text"), dict) else {}
             values = [
                 str(item.get("code") or ""),
                 str(item.get("name") or ""),
                 f"{float(item.get('price') or 0):.3f}" if item.get("price") is not None else "-",
                 pct(float(item.get("change_pct") or 0)) if item.get("change_pct") is not None else "-",
+                str(technical_text.get("sample") or "-"),
                 str(item.get("trend") or ""),
+                str(technical_text.get("ma") or "-"),
                 str(item.get("rsi") or ""),
+                str(technical_text.get("macd") or "-"),
+                str(technical_text.get("kdj") or "-"),
+                str(technical_text.get("volume") or "-"),
+                str(technical_text.get("support") or "-"),
+                str(technical_text.get("resistance") or "-"),
                 str(item.get("money_flow") or ""),
                 str(item.get("risk") or ""),
                 pct(float(item.get("weight_pct") or 0)),
                 str(item.get("pending_count") or 0),
             ]
             self._set_row(self.strategy_signal_table, row, values, sign)
-            for col in (4, 5, 6, 7):
+            for col in (4, 5, 6, 7, 8, 9, 10, 13, 14):
                 cell = self.strategy_signal_table.item(row, col)
                 if cell:
                     cell.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
@@ -3806,6 +4171,7 @@ class MainWindow(QMainWindow):
         preview = {
             "strategy_catalog": catalog,
             "market_rows": rows,
+            "kline_history_file": CODEX_KLINE_FILE,
             "account_curve": self.strategy_context().get("account_curve"),
         }
         self.strategy_context_preview.setPlainText(json.dumps(preview, ensure_ascii=False, indent=2))
@@ -3911,9 +4277,10 @@ class MainWindow(QMainWindow):
             )
         agent_spec = "；".join(agent_lines)
         return (
-            "你是 AIStockSim 的外部 AI 多智能体投资分析模块，只分析模拟盘，不操作真实账户。"
-            "输入里包含真实行情、持仓、委托、风控配置，以及本地策略上下文 strategy_context。"
-            "strategy_context 只是确定性策略/风控信号，供你参考，不是最终结论；最终多智能体分析必须由你完成。"
+              "你是 AIStockSim 的外部 AI 多智能体投资分析模块，只分析模拟盘，不操作真实账户。"
+              "输入里包含真实行情、全量历史日K技术画像、持仓、委托、风控配置，以及本地策略上下文 strategy_context。"
+              "strategy_context 只是确定性策略/风控信号，供你参考，不是最终结论；最终多智能体分析必须由你完成。"
+              "不要只根据今日涨跌幅下结论；技术面至少参考 MA5/10/20/60/120/250、量能、支撑压力、MACD、KDJ 和近期交易质量。"
             f"本次启用的 agent pipeline 是：{agent_spec}。"
             "请严格按照启用的 agent 输出 agents 数组，除非某角色输入不足，否则不要省略。"
             "请严格输出一个 JSON 对象，不要 Markdown，不要解释性前后缀。"
@@ -4594,7 +4961,8 @@ class MainWindow(QMainWindow):
                 "role": "system",
                 "content": (
                     "你是 AIStockSim 的 Agent Chatroom，只讨论模拟盘，不操作真实账户。"
-                    "回答要基于当前账户、行情、风险审计、策略上下文和最新多智能体报告。"
+                    "回答要基于当前账户、行情、全量历史日K技术画像、风险审计、策略上下文和最新多智能体报告。"
+                    "不要只看今日涨跌幅；需要结合均线、量能、支撑压力、MACD、KDJ 和近期交易质量。"
                     "如果给出买卖想法，只能用自然语言说明条件和风险，不要输出可直接执行的 JSON 指令。"
                     "需要明确区分事实、推断和不确定性。"
                 ),
@@ -4982,9 +5350,11 @@ class MainWindow(QMainWindow):
         positions = self.store.positions()
         codes = sorted(set(self.store.watchlist + list(positions.keys())))
         strategy_signals = {}
+        daily_technical_profiles = {}
         for code in codes:
             trend, rsi, risk = self.strategy_signals(code, self.quote_cache.get(code))
             strategy_signals[code] = {"trend": trend, "rsi": rsi, "risk": risk}
+            daily_technical_profiles[code] = self.technical_profile(code)
         latest_report = self.store.latest_agent_report() or {}
         return {
             "date": today_str(),
@@ -4999,6 +5369,7 @@ class MainWindow(QMainWindow):
             "risk": self.store.risk_config(),
             "ai_pipeline": self.store.ai_pipeline_config(),
             "strategy_signals": strategy_signals,
+            "daily_technical_profiles": daily_technical_profiles,
             "strategy_context": self.strategy_context(),
             "latest_agent_report": {
                 "id": latest_report.get("id"),
@@ -5026,6 +5397,7 @@ class MainWindow(QMainWindow):
             "每个元素格式为 {\"action\":\"buy|sell|hold\", \"code\":\"sh600000\", \"qty\":100, \"limit_price\":10.5, \"reason\":\"简短理由\"}。"
             "buy/sell 必须提供 limit_price；hold 可以省略 qty 和 limit_price。"
             "买入委托在实时价小于等于 limit_price 时成交，卖出委托在实时价大于等于 limit_price 时成交。"
+            "不要只根据今日涨跌幅下单；必须参考快照里的 daily_technical_profiles、strategy_context.market_rows[].technical、均线、量能、支撑压力、MACD、KDJ 和风控。"
             "只允许使用快照里的股票代码；这是虚拟交易，不构成投资建议。"
         )
         payload = {
@@ -5097,10 +5469,31 @@ class MainWindow(QMainWindow):
                 "orders_file": CODEX_ORDER_FILE,
                 "snapshot_file": CODEX_SNAPSHOT_FILE,
                 "result_file": CODEX_RESULT_FILE,
+                "kline_history_file": CODEX_KLINE_FILE,
                 "polling": True,
                 "schema": snapshot.get("codex_order_schema"),
             }
             save_json(CODEX_SNAPSHOT_FILE, snapshot)
+        except Exception:
+            return
+
+    def write_codex_kline_history(self) -> None:
+        try:
+            payload = {
+                "time": now_str(),
+                "source": "东方财富日K",
+                "note": "软件尽量拉取接口返回的全部可用日K；codex_snapshot.json 只放技术摘要，完整K线在本文件。",
+                "symbols": {
+                    code: {
+                        "sample_count": len(rows),
+                        "first_date": rows[0].date if rows else "",
+                        "last_date": rows[-1].date if rows else "",
+                        "klines": [item.__dict__.copy() for item in rows],
+                    }
+                    for code, rows in self.daily_kline_cache.items()
+                },
+            }
+            save_json(CODEX_KLINE_FILE, payload)
         except Exception:
             return
 
