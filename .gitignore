@@ -2,8 +2,16 @@ __pycache__/
 *.py[cod]
 build/
 dist/
+.venv/
 *.spec.bak
 *.log
+backups/
+reports/backtest/
+reports/
+AIStockSim_*AI*.md
+codex_snapshot.json
+codex_result.json
+codex_kline_history.json
 
 # Local runtime data. Real account/simulation records live in AppData,
 # but keep these names ignored if users export them into the repo folder.

@@ -2,6 +2,7 @@
 # python -m PyInstaller -F -w .\StockTradingSim.py --name StockTradingSim --icon .\StockWidget.ico --add-data ".\StockWidget.ico;."
 import datetime as dt
 import json
+import math
 import os
 import re
 import sys
@@ -11,6 +12,10 @@ from typing import Any
 
 import requests
 import StockWidget as LegacyStockWidget
+from app_theme import configure_light_theme
+from local_strategy_panel import LocalStrategyPanel
+from local_strategy_runtime import quote_freshness_error
+from window_state import MainWindowState
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtCore import QSize
 from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPen
@@ -29,6 +34,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QLayout,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -50,9 +56,9 @@ from PySide6.QtWidgets import (
 
 
 APP_NAME = "StockTradingSim"
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.3.0"
 DISPLAY_NAME = "AIStockSim - AI模拟炒股及摸鱼盯盘工具"
-CONFIG_DIR = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~"), APP_NAME)
+CONFIG_DIR = os.path.abspath(os.getenv("AISTOCKSIM_DATA_DIR") or os.path.join(os.getenv("APPDATA") or os.path.expanduser("~"), APP_NAME))
 CONFIG_FILE = os.path.join(CONFIG_DIR, "portfolio.json")
 CODEX_ORDER_FILE = os.path.join(CONFIG_DIR, "codex_orders.json")
 CODEX_SNAPSHOT_FILE = os.path.join(CONFIG_DIR, "codex_snapshot.json")
@@ -72,24 +78,35 @@ BACKGROUND_REFRESH_SECONDS = 30
 IDLE_REFRESH_SECONDS = 60
 CODEX_POLL_SECONDS = 5
 MARKET_GATE_CODES = ["sh000001", "sz399001", "sz399006"]
+MAX_PENDING_PER_CODE = 3
 STRATEGY_LIBRARY = [
+    {
+        "id": "chan_daily", "name": "缠论日线笔结构（实验）", "group": "独立本地信号",
+        "default_enabled": True,
+        "definition": "日K包含、分型、严格笔与三笔中枢代理；可选一、二、三类买卖点及背驰结构条件。属于笔级实验代理，不是完整递归缠论。",
+        "purpose": "产生可重放、可回测的本地候选，并明确数据、结构、风控和成交各阶段。",
+        "inputs": "已收盘日K、结构确认日期、实时有效报价、账户与市场规则。",
+        "outputs": "信号ID、确认日、结构失效位、数量与未下单原因。",
+        "ai_usage": "先读 strategy_context.local_structure；CAN SLIM评分不是结构买点的必要条件。",
+        "hard_rules": ["右侧确认不回填历史买点", "已完成日K确认后形成候选", "保留持仓结构止损退出", "本地模拟自动提交单独设置"],
+    },
     {
         "id": "market_gate",
         "name": "市场环境闸门",
         "group": "CAN SLIM - M",
-        "default_enabled": True,
+        "default_enabled": False,
         "definition": "先判断大盘与主要指数是否支持做多；市场转弱时，现金也是主动仓位。",
         "purpose": "避免单只股票看似有机会，但处在整体弱市或分化市时盲目开新仓。",
         "inputs": "上证指数、深证成指、创业板指行情与日K；自选股趋势联动。",
-        "outputs": "绿色/黄色/红色市场闸门，新开仓许可、仓位收缩提示。",
-        "ai_usage": "AI 必须先读取 strategy_context.market_gate；红灯时不应提出新开多单。",
-        "hard_rules": ["市场红灯不新开多仓", "弱市降低仓位和提高买点质量"],
+        "outputs": "绿色/黄色/红色市场环境观察，说明指数强弱及数据缺项。",
+        "ai_usage": "仅在用户启用时参考 strategy_context.market_gate；环境评分不构成下单许可或否决。",
+        "hard_rules": ["标明指数样本与数据缺项", "环境评分仅供观察"],
     },
     {
         "id": "canslim_radar",
-        "name": "CAN SLIM 强势股雷达",
+        "name": "CAN SLIM 价格量能参考",
         "group": "CAN SLIM - C/A/N/S/L/I",
-        "default_enabled": True,
+        "default_enabled": False,
         "definition": "用可获得的价格、量能、资金流和相对强弱近似评估 CAN SLIM 七要素；基本面缺失时明确降置信度。",
         "purpose": "把自选股分成领导者、近买点、观察、风险票和弱势剔除，而不是只看今日涨跌。",
         "inputs": "历史日K、MA、RSI、MACD/KDJ、60日强弱、量能、主力资金流、持仓状态。",
@@ -101,31 +118,31 @@ STRATEGY_LIBRARY = [
         "id": "buy_point_discipline",
         "name": "买点纪律",
         "group": "交易执行",
-        "default_enabled": True,
+        "default_enabled": False,
         "definition": "等待有效突破、回踩支撑或均线修复，不在远离枢轴/压力位时追高。",
         "purpose": "让买入理由从“看着涨了”变成“接近可定义风险的买点”。",
         "inputs": "MA20/60、20/60日高低点、压力位、VWAP、量能放大。",
         "outputs": "近买点、偏晚、回踩观察、拒绝追高等执行标签。",
         "ai_usage": "AI 提买入必须说明买点类型、委托价、失效条件和是否已偏离买点。",
-        "hard_rules": ["不要在买点上方过远追入", "没有失效点就不买"],
+        "hard_rules": ["说明买点类型及价格依据", "标明已知失效条件和数据缺项"],
     },
     {
         "id": "sell_discipline",
         "name": "卖出纪律",
         "group": "风险退出",
-        "default_enabled": True,
+        "default_enabled": False,
         "definition": "先写退出规则，再谈收益；用 7%-8% 止损、3%-4% 战术风险、20%-25% 盈利保护和支撑破位处理持仓。",
         "purpose": "防止亏损越拖越大，也防止接近 20% 的盈利坐回亏损。",
         "inputs": "持仓成本/摊余回本价、当前价、MA/支撑、成交量、分时 VWAP、可卖数量。",
         "outputs": "止损复核、盈利保护、支撑破位、清仓/减仓观察。",
-        "ai_usage": "AI 对持仓必须给出风险线；亏损持仓只允许按规则减仓/等待，不允许无条件补仓。",
-        "hard_rules": ["不摊低弱势个股成本", "亏损先控风险", "盈利到位要保护"],
+        "ai_usage": "用户启用时给出持仓盈亏、退出条件及依据；这些观察不禁止继续买入。",
+        "hard_rules": ["退出建议说明依据", "区分观察性提示与用户委托"],
     },
     {
         "id": "intraday_vwap_execution",
         "name": "分时/VWAP 执行",
         "group": "交易执行",
-        "default_enabled": True,
+        "default_enabled": False,
         "definition": "日K决定是否值得做，分时 VWAP、5/15/30 分钟变化和尾盘信号决定怎么挂单。",
         "purpose": "减少盘中追涨杀跌，让限价委托更贴近可成交和可控风险的位置。",
         "inputs": "当日分时、VWAP/均价线、近5/15/30分钟收益、尾盘抢筹/走弱。",
@@ -137,19 +154,19 @@ STRATEGY_LIBRARY = [
         "id": "portfolio_risk",
         "name": "组合仓位纪律",
         "group": "组合管理",
-        "default_enabled": True,
+        "default_enabled": False,
         "definition": "少数高质量仓位优先，现金可等待；集中度、ST、同主题拥挤和活动委托都要被看见。",
         "purpose": "避免把模拟资金铺满一堆同质弱信号，也避免单票或单主题风险失控。",
         "inputs": "可用现金、冻结资金、持仓权重、ST 标签、活动委托、交易质量。",
-        "outputs": "超仓、接近上限、现金不足、优先处理对象和再平衡建议。",
-        "ai_usage": "AI 的组合经理角色必须先处理超仓/风险票，再谈新机会。",
-        "hard_rules": ["现金不是必须花掉", "先卖弱者，不因盈利就卖强者"],
+        "outputs": "持仓比例、可用现金、冻结资金、活动委托数量和组合观察。",
+        "ai_usage": "仅在用户启用时说明持仓分布，不设置比例上限，不禁止ST或持仓加买。",
+        "hard_rules": ["使用实际可用资金和可卖数量", "同一证券活动委托最多3条"],
     },
     {
         "id": "review_expectancy",
         "name": "交易复盘与期望值",
         "group": "复盘",
-        "default_enabled": True,
+        "default_enabled": False,
         "definition": "用平均收益、平均亏损、规则遵守和最大回撤评价过程，不用单笔胜负评价 AI 或用户。",
         "purpose": "让模拟盘更像训练系统：错了能知道错在哪，对了也能知道是不是侥幸。",
         "inputs": "交易记录、账户曲线、操作者表现、交易质量提示。",
@@ -171,8 +188,8 @@ DEFAULT_AI_PIPELINE = [
     },
     {
         "enabled": True,
-        "role": "CAN SLIM 纪律官",
-        "inputs": "策略组合、市场闸门、CAN SLIM 雷达、买点/卖出纪律",
+        "role": "策略纪律官",
+        "inputs": "已启用策略、本地结构候选及确认日、失效位、执行限制",
         "outputs": "策略匹配度、买点质量、止损/盈利保护、是否允许开新仓",
     },
     {
@@ -336,6 +353,16 @@ def normalize_code(raw: str) -> str | None:
     return None
 
 
+def parse_order_quantity(value: Any) -> int:
+    try:
+        numeric = float(value)
+        if isinstance(value, bool) or not math.isfinite(numeric) or numeric <= 0 or numeric != int(numeric):
+            raise ValueError
+        return int(numeric)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("委托数量必须是明确的正整数股数") from None
+
+
 def normalize_order_side(raw: Any) -> str:
     s = str(raw or "").strip().lower()
     if s in ("buy", "b"):
@@ -397,9 +424,15 @@ def default_board_lot(code: str) -> int:
     return 100
 
 
+def is_tradable_security(code: str) -> bool:
+    """The supported mainland benchmark indices are quotes, not securities."""
+    norm = normalize_code(code)
+    return bool(norm and not norm.startswith(("sh000", "sz399")))
+
+
 def buy_quantity_rule(code: str, board_lot: int) -> tuple[int, int, str]:
     if code.startswith("sh688"):
-        return 200, 100, "科创板最低 200 股，之后按 100 股递增"
+        return 200, 1, "科创板最低 200 股，之后按 1 股递增"
     if code.startswith("hk"):
         return board_lot, board_lot, f"港股按每手 {board_lot} 股买入"
     return board_lot, board_lot, f"{market_name(code)}按每手 {board_lot} 股买入"
@@ -421,6 +454,7 @@ class Quote:
     time_label: str
     source: str
     currency: str
+    asof_date: str = ""
 
 
 @dataclass
@@ -679,28 +713,36 @@ class QuoteService:
             data = (payload or {}).get("data") or {}
             klines = data.get("klines") or []
             rows: list[DailyKLine] = []
+            truncated = False
             for raw in klines:
                 parts = str(raw).split(",")
                 if len(parts) < 11:
+                    rows.clear()
+                    truncated = True
                     continue
-                close = self._to_float(parts[2])
-                if close <= 0:
+                op, close, high, low = [self._to_float(parts[index]) for index in (1, 2, 3, 4)]
+                if (not all(math.isfinite(value) and value > 0 for value in (op, close, high, low))
+                        or not low <= min(op, close) <= max(op, close) <= high):
+                    # Invalid adjusted prices must break the history. Keeping
+                    # the bars on both sides would invent continuous structure.
+                    rows.clear()
+                    truncated = True
                     continue
                 rows.append(
                     DailyKLine(
                         code=norm,
                         date=parts[0],
-                        open=self._to_float(parts[1]),
+                        open=op,
                         close=close,
-                        high=self._to_float(parts[3]),
-                        low=self._to_float(parts[4]),
+                        high=high,
+                        low=low,
                         volume=self._to_float(parts[5]),
                         amount=self._to_float(parts[6]),
                         amplitude=self._to_float(parts[7]),
                         change_pct=self._to_float(parts[8]),
                         change=self._to_float(parts[9]),
                         turnover=self._to_float(parts[10]),
-                        source="东方财富日K",
+                        source="东方财富日K（无效前复权/缺损K线前史已截断）" if truncated else "东方财富日K",
                     )
                 )
             return rows
@@ -768,7 +810,8 @@ class QuoteService:
                 if price <= 0:
                     continue
                 ts = int(item.get("f124") or 0)
-                time_label = dt.datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts > 0 else "-"
+                timestamp = dt.datetime.fromtimestamp(ts, tz=dt.timezone(dt.timedelta(hours=8))) if ts > 0 else None
+                time_label = timestamp.strftime("%H:%M:%S") if timestamp else "-"
                 out[code] = Quote(
                     code=code,
                     name=str(item.get("f14") or code),
@@ -778,6 +821,7 @@ class QuoteService:
                     time_label=time_label,
                     source="东方财富",
                     currency="HKD",
+                    asof_date=timestamp.date().isoformat() if timestamp else "",
                 )
         except Exception:
             return
@@ -792,8 +836,7 @@ class QuoteService:
                 headers={"Referer": "https://finance.sina.com.cn", "User-Agent": "Mozilla/5.0"},
                 timeout=4,
             )
-            resp.encoding = "gbk"
-            for line in resp.text.splitlines():
+            for line in self._decode_sina_response(resp.content).splitlines():
                 if '="' not in line:
                     continue
                 code = line.split('="', 1)[0].split("_")[-1]
@@ -821,7 +864,8 @@ class QuoteService:
             change = price - prev
         if change_pct == 0 and price and prev:
             change_pct = (price / prev - 1) * 100
-        return Quote(code, name, price, change, change_pct, parts[18] or "-", "新浪HK", "HKD")
+        return Quote(code, name, price, change, change_pct, parts[18] or "-", "新浪HK", "HKD",
+                     self._normalize_quote_date(parts[17]))
 
     def _parse_sina_cn(self, code: str, parts: list[str]) -> Quote | None:
         if len(parts) < 32:
@@ -831,7 +875,24 @@ class QuoteService:
         prev = self._to_float(parts[2])
         change = price - prev if price and prev else 0.0
         change_pct = (price / prev - 1) * 100 if price and prev else 0.0
-        return Quote(code, name, price, change, change_pct, parts[31] or "-", "新浪", "CNY")
+        return Quote(code, name, price, change, change_pct, parts[31] or "-", "新浪", "CNY",
+                     self._normalize_quote_date(parts[30]))
+
+    @staticmethod
+    def _decode_sina_response(content: bytes) -> str:
+        # Endpoints/proxies can return UTF-8 despite older GBK assumptions.
+        # Strict decoding avoids silently accepting corrupted stock names.
+        try:
+            return content.decode("utf-8-sig", errors="strict")
+        except UnicodeDecodeError:
+            return content.decode("gb18030", errors="strict")
+
+    @staticmethod
+    def _normalize_quote_date(value: Any) -> str:
+        try:
+            return dt.datetime.strptime(str(value).strip().replace("/", "-"), "%Y-%m-%d").date().isoformat()
+        except (ValueError, TypeError):
+            return ""
 
     @staticmethod
     def _to_float(value: Any) -> float:
@@ -928,21 +989,11 @@ class PortfolioStore:
             "agent_reports": [],
             "agent_chat": [],
             "risk": {
-                "enabled": True,
-                "block_st_buy": True,
-                "block_chasing_high": True,
-                "max_buy_change_pct": 7.0,
-                "loss_position_reduce_only": True,
-                "loss_position_threshold_pct": -3.0,
-                "block_new_position_near_close": True,
-                "near_close_minutes": 15,
-                "max_position_pct": 65.0,
-                "max_single_buy_pct": 25.0,
-                "max_pending_per_code": 3,
+                "max_pending_per_code": MAX_PENDING_PER_CODE,
             },
             "strategy_settings": {
                 "enabled_ids": DEFAULT_ENABLED_STRATEGY_IDS.copy(),
-                "active_pack": "canslim_discipline",
+                "active_pack": "chan_daily",
             },
             "ai": {
                 "api_base": "https://api.openai.com/v1",
@@ -969,6 +1020,7 @@ class PortfolioStore:
                     current.setdefault(sub_key, sub_value)
             else:
                 self.data.setdefault(key, value)
+        self.risk_config()
 
     def save(self) -> None:
         self.data["version"] = APP_VERSION
@@ -991,18 +1043,14 @@ class PortfolioStore:
         self.save()
 
     def risk_config(self) -> dict[str, Any]:
-        defaults = self._default()["risk"]
-        cfg = self.data.setdefault("risk", {})
-        if not isinstance(cfg, dict):
-            cfg = defaults.copy()
-            self.data["risk"] = cfg
-        for key, value in defaults.items():
-            cfg.setdefault(key, value)
+        # The user retained exactly this fixed order-count limit. Old settings
+        # must not resurrect removed price, loss, time or exposure restrictions.
+        cfg = {"max_pending_per_code": MAX_PENDING_PER_CODE}
+        self.data["risk"] = cfg
         return cfg
 
     def set_risk_config(self, cfg: dict[str, Any]) -> None:
-        current = self.risk_config()
-        current.update(cfg)
+        self.risk_config()
         self.save()
 
     def strategy_config(self) -> dict[str, Any]:
@@ -1020,6 +1068,14 @@ class PortfolioStore:
             if strategy_id in STRATEGY_LIBRARY_BY_ID and strategy_id not in normalized:
                 normalized.append(strategy_id)
         cfg["enabled_ids"] = normalized
+        # User-requested migration: unrelated legacy strategies start unchecked.
+        if cfg.get("local_structure_version") != 2:
+            cfg["local_structure_version"] = 2
+            cfg["enabled_ids"] = ["chan_daily"]
+            cfg["active_pack"] = "chan_daily"
+            cfg.setdefault("local_mode", "first_second_third")
+            cfg.setdefault("local_auto_submit", False)
+        cfg.setdefault("local_mode", "first_second_third")
         cfg.setdefault("active_pack", defaults["active_pack"])
         return cfg
 
@@ -1206,6 +1262,8 @@ class PortfolioStore:
         return buy_quantity_rule(code, self.board_lot(code))
 
     def validate_buy_quantity(self, code: str, qty: int) -> None:
+        if not is_tradable_security(code):
+            raise ValueError(f"{code} 为指数或无效代码，仅供观察，不能模拟交易")
         min_qty, step, label = self.order_rule(code)
         if qty < min_qty:
             raise ValueError(f"{label}；当前数量低于最低买入数量 {min_qty} 股")
@@ -1220,6 +1278,8 @@ class PortfolioStore:
             raise ValueError(f"{label}；当前数量必须是 {step} 的整数倍")
 
     def validate_sell_quantity(self, code: str, qty: int, available_qty: int) -> None:
+        if not is_tradable_security(code):
+            raise ValueError(f"{code} 为指数或无效代码，仅供观察，不能模拟交易")
         min_qty, step, label = sell_quantity_rule(code, self.board_lot(code), int(available_qty))
         if qty < min_qty:
             raise ValueError(f"{label}；当前卖出数量低于最低卖出数量 {min_qty} 股")
@@ -1248,9 +1308,18 @@ class PortfolioStore:
                 total += int(order.get("qty") or 0)
         return total
 
-    def available_sell_qty(self, code: str) -> int:
+    def available_sell_qty(self, code: str, *, local_only: bool = False) -> int:
         pos = self.positions().get(code) or {}
-        return max(0, int(pos.get("available") or 0) - self.reserved_sell_qty(code))
+        available = max(0, int(pos.get("available") or 0) - self.reserved_sell_qty(code))
+        if local_only:
+            local_qty = sum(int(lot.get("qty") or 0) for lot in self.data.get("lots", [])
+                            if lot.get("code") == code and lot.get("local_signal_id")
+                            and (code.startswith("hk") or str(lot.get("buy_date", today_str())) < today_str()))
+            local_reserved = sum(int(order.get("qty") or 0) for order in self.active_pending_orders()
+                                 if order.get("code") == code and order.get("action") == "SELL"
+                                 and order.get("local_signal_id"))
+            available = min(available, max(0, local_qty - local_reserved))
+        return available
 
     def reset(self, initial_cash: float) -> None:
         self.data["cash"] = round(float(initial_cash), 2)
@@ -1262,10 +1331,15 @@ class PortfolioStore:
         self.data["account_history"] = []
         self.save()
 
-    def add_pending_order(self, action: str, quote: Quote, qty: int, limit_price: float, operator: str, reason: str = "") -> dict[str, Any]:
+    def add_pending_order(self, action: str, quote: Quote, qty: int, limit_price: float, operator: str, reason: str = "", *, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         action_name = action.upper()
-        qty = int(qty)
+        qty = parse_order_quantity(qty)
         limit_price = float(limit_price)
+        active_count = sum(str(order.get("code") or "") == quote.code for order in self.active_pending_orders())
+        if active_count >= MAX_PENDING_PER_CODE:
+            raise ValueError(f"{quote.code} 已有 {active_count} 条活动委托，同代码最多 {MAX_PENDING_PER_CODE} 条")
+        if action_name not in ("BUY", "SELL") or qty <= 0 or not math.isfinite(limit_price) or limit_price <= 0:
+            raise ValueError("委托方向、数量或限价无效")
         if action_name == "BUY":
             self.validate_buy_quantity(quote.code, qty)
             required = round(limit_price * qty, 2)
@@ -1273,7 +1347,7 @@ class PortfolioStore:
             if required > available + 1e-6:
                 raise ValueError(f"可用资金不足；该买入委托需冻结 {money(required, quote.currency)}，当前剩余可用资金 {money(available)}")
         elif action_name == "SELL":
-            available_qty = self.available_sell_qty(quote.code)
+            available_qty = self.available_sell_qty(quote.code, local_only=bool(metadata and metadata.get("local_signal_id")))
             self.validate_sell_quantity(quote.code, qty, available_qty)
             if qty > available_qty:
                 raise ValueError(f"可卖数量不足；当前剩余可卖 {available_qty} 股")
@@ -1291,6 +1365,10 @@ class PortfolioStore:
             "status": "ACTIVE",
             "reason": reason,
         }
+        for key in ("local_signal_id", "local_auto_event_id", "structure_stop", "signal_date",
+                    "signal_confirmed_at", "local_model", "local_submission_kind"):
+            if metadata and key in metadata:
+                order[key] = metadata[key]
         self.data.setdefault("pending_orders", []).append(order)
         self.save()
         return order
@@ -1341,9 +1419,9 @@ class PortfolioStore:
             raise ValueError(error or "No matching active pending order.")
         action_name = str(order.get("action") or "").upper()
         target_code = str(order.get("code") or "")
-        new_qty = int(qty if qty is not None else int(order.get("qty") or 0))
+        new_qty = parse_order_quantity(qty if qty is not None else order.get("qty"))
         new_limit_price = float(limit_price if limit_price is not None else float(order.get("limit_price") or 0))
-        if new_qty <= 0 or new_limit_price <= 0:
+        if new_qty <= 0 or not math.isfinite(new_limit_price) or new_limit_price <= 0:
             raise ValueError("Updated qty and limit_price must be greater than 0.")
         if action_name == "BUY":
             self.validate_buy_quantity(target_code, new_qty)
@@ -1354,7 +1432,7 @@ class PortfolioStore:
                 raise ValueError(f"Available cash is not enough for updated buy order; required {required:.2f}, available {available:.2f}.")
         elif action_name == "SELL":
             current_reserved = int(order.get("qty") or 0)
-            available_qty = self.available_sell_qty(target_code) + current_reserved
+            available_qty = self.available_sell_qty(target_code, local_only=bool(order.get("local_signal_id"))) + current_reserved
             self.validate_sell_quantity(target_code, new_qty, available_qty)
             if new_qty > available_qty:
                 raise ValueError(f"Sell quantity is not enough for updated order; available {available_qty}.")
@@ -1381,12 +1459,17 @@ class PortfolioStore:
                 return True
         return False
 
-    def buy(self, quote: Quote, qty: int, operator: str = "用户", reason: str = "") -> dict[str, Any]:
-        if qty <= 0:
-            raise ValueError("数量必须大于 0")
+    def buy(self, quote: Quote, qty: int, operator: str = "用户", reason: str = "", *, pending_order_id: str = "") -> dict[str, Any]:
+        qty = parse_order_quantity(qty)
         self.validate_buy_quantity(quote.code, qty)
+        if not math.isfinite(quote.price) or quote.price <= 0:
+            raise ValueError("成交价格无效")
+        own_order = next((order for order in self.active_pending_orders()
+                          if pending_order_id and order.get("id") == pending_order_id
+                          and order.get("code") == quote.code and order.get("action") == "BUY"), None)
+        own_reserved = float(own_order["limit_price"]) * int(own_order["qty"]) if own_order else 0.0
         cost = quote.price * qty
-        if cost > self.cash + 1e-6:
+        if cost > self.cash - self.reserved_cash() + own_reserved + 1e-6:
             raise ValueError("可用资金不足")
         self.set_cash(self.cash - cost)
         self.data.setdefault("lots", []).append(
@@ -1415,33 +1498,64 @@ class PortfolioStore:
             "reason": reason,
         }
         self.data.setdefault("trades", []).append(trade)
+        if own_order:
+            lot = self.data["lots"][-1]
+            for key in ("local_signal_id", "structure_stop"):
+                if key in own_order:
+                    lot[key] = own_order[key]
+            own_order.update(status="FILLED", filled_at=now_str(), filled_price=round(quote.price, 4))
+            own_order.pop("wait_reason", None)
         self.save()
         return trade
 
-    def sell(self, quote: Quote, qty: int, operator: str = "用户", reason: str = "") -> dict[str, Any]:
-        if qty <= 0:
-            raise ValueError("数量必须大于 0")
+    def sell(self, quote: Quote, qty: int, operator: str = "用户", reason: str = "", *, local_only: bool = False, pending_order_id: str = "") -> dict[str, Any]:
+        qty = parse_order_quantity(qty)
+        if not math.isfinite(quote.price) or quote.price <= 0:
+            raise ValueError("成交价格无效")
+        eligible_lots = [
+            lot for lot in self.data.get("lots", [])
+            if lot.get("code") == quote.code
+            and int(lot.get("qty") or 0) > 0
+            and (not local_only or bool(lot.get("local_signal_id")))
+            and (quote.code.startswith("hk") or str(lot.get("buy_date", today_str())) < today_str())
+        ]
+        available_qty = sum(int(lot.get("qty") or 0) for lot in eligible_lots)
+        own_order = next((order for order in self.active_pending_orders()
+                          if pending_order_id and order.get("id") == pending_order_id
+                          and order.get("code") == quote.code and order.get("action") == "SELL"), None)
+        own_reserved = int(own_order["qty"]) if own_order else 0
+        available_qty = min(available_qty, self.available_sell_qty(quote.code) + own_reserved)
+        local_reserved = sum(int(order.get("qty") or 0) for order in self.active_pending_orders()
+                             if order.get("code") == quote.code and order.get("action") == "SELL"
+                             and order.get("local_signal_id") and order is not own_order)
+        if local_only:
+            available_qty = min(available_qty, sum(int(lot["qty"]) for lot in eligible_lots) - local_reserved)
+        self.validate_sell_quantity(quote.code, qty, available_qty)
+        if qty > available_qty:
+            raise ValueError("可卖数量不足；A 股同日买入按 T+1 规则不可卖出，港股支持当日卖出")
         remaining = qty
         proceeds = 0.0
         profit = 0.0
-        for lot in self.data.get("lots", []):
+        allocations: list[tuple[dict[str, Any], int]] = []
+        local_budget = max(0, sum(int(lot["qty"]) for lot in eligible_lots if lot.get("local_signal_id")) - local_reserved)
+        for lot in eligible_lots:
             if remaining <= 0:
                 break
-            if lot.get("code") != quote.code:
-                continue
-            if str(lot.get("buy_date", today_str())) >= today_str():
-                continue
             available = int(lot.get("qty") or 0)
-            if available <= 0:
-                continue
             use_qty = min(available, remaining)
-            lot["qty"] = available - use_qty
+            if lot.get("local_signal_id"):
+                use_qty = min(use_qty, local_budget)
+                local_budget -= use_qty
+            allocations.append((lot, available - use_qty))
             remaining -= use_qty
             proceeds += quote.price * use_qty
             breakeven_price = float(lot.get("breakeven_price") or lot.get("buy_price") or 0)
             profit += (quote.price - breakeven_price) * use_qty
-        if remaining > 0:
-            raise ValueError("可卖数量不足；同日买入的股票按 T+1 规则不可卖出")
+        if remaining:
+            raise ValueError("可卖数量不足，部分本地策略持仓已由其他卖单冻结")
+        # Complete validation/calculation before changing any lot or cash balance.
+        for lot, remaining_qty in allocations:
+            lot["qty"] = remaining_qty
         self.data["lots"] = [lot for lot in self.data.get("lots", []) if int(lot.get("qty") or 0) > 0]
         self.set_cash(self.cash + proceeds)
         trade = {
@@ -1457,6 +1571,9 @@ class PortfolioStore:
             "reason": reason,
         }
         self.data.setdefault("trades", []).append(trade)
+        if own_order:
+            own_order.update(status="FILLED", filled_at=now_str(), filled_price=round(quote.price, 4))
+            own_order.pop("wait_reason", None)
         self.save()
         return trade
 
@@ -1493,7 +1610,7 @@ class PortfolioStore:
                 item["actual_cost_complete"] = False
             else:
                 item["actual_cost_amount"] += float(actual_price) * qty
-            if str(lot.get("buy_date", today_str())) < today_str():
+            if code.startswith("hk") or str(lot.get("buy_date", today_str())) < today_str():
                 item["available"] += qty
         for item in pos.values():
             qty = int(item["qty"])
@@ -1649,8 +1766,82 @@ class MainSettingsDialog(LegacyStockWidget.SettingsDialog):
             3: QSize(500, 450),
             4: QSize(420, 390),
         }
+        self._make_pages_scrollable()
         self.tabs.setCurrentIndex(0)
         self._apply_tab_size(0)
+
+    def _make_pages_scrollable(self) -> None:
+        # Fixed dialog dimensions must not squeeze nested groups until their
+        # checkboxes disappear, especially with Windows display scaling.
+        was_blocked = self.tabs.blockSignals(True)
+        for index in range(self.tabs.count()):
+            content = self.tabs.widget(index)
+            if isinstance(content, QScrollArea):
+                continue
+            title = self.tabs.tabText(index)
+            if content.layout() is not None:
+                content.layout().setSizeConstraint(QLayout.SetMinimumSize)
+            scroll = QScrollArea()
+            scroll.setFrameShape(QFrame.NoFrame)
+            scroll.setWidgetResizable(True)
+            self.tabs.removeTab(index)
+            scroll.setWidget(content)
+            self.tabs.insertTab(index, scroll, title)
+        self.tabs.blockSignals(was_blocked)
+
+    def _apply_tab_size(self, index: int) -> None:
+        preferred = self.tab_sizes.get(index, QSize(520, 430))
+        self.ensure_on_screen(preferred=preferred)
+        if self.isVisible():
+            # Native frame margins can settle one event after the resize.
+            QTimer.singleShot(0, self.ensure_on_screen)
+
+    def _placement_screen(self):
+        frame = self.frameGeometry()
+        screens = QApplication.screens()
+        if self.isVisible() and screens:
+            def overlap(screen):
+                rect = frame.intersected(screen.availableGeometry())
+                return max(0, rect.width()) * max(0, rect.height())
+            screen = max(screens, key=overlap)
+            if overlap(screen) > 0:
+                return screen
+        parent = self.parentWidget()
+        return (parent.screen() if parent is not None else self.screen()) or QApplication.primaryScreen()
+
+    def ensure_on_screen(self, *, preferred: QSize | None = None, center: bool = False) -> None:
+        screen = self._placement_screen()
+        if screen is None:
+            return
+        bounds = screen.availableGeometry().adjusted(12, 12, -12, -12)
+        old_frame = self.frameGeometry()
+        if preferred is None:
+            preferred = self.tab_sizes.get(self.tabs.currentIndex(), QSize(520, 430))
+        decoration = QSize(max(0, old_frame.width() - self.width()),
+                           max(0, old_frame.height() - self.height()))
+        maximum = (bounds.size() - decoration).expandedTo(QSize(1, 1))
+        self.setFixedSize(preferred.boundedTo(maximum))
+        if not self.isVisible():
+            return
+        frame = self.frameGeometry()
+        target = frame.topLeft()
+        if center or not old_frame.intersects(bounds):
+            target.setX(bounds.x() + (bounds.width() - frame.width()) // 2)
+            target.setY(bounds.y() + (bounds.height() - frame.height()) // 2)
+        x = max(bounds.left(), min(target.x(), bounds.right() - frame.width() + 1))
+        y = max(bounds.top(), min(target.y(), bounds.bottom() - frame.height() + 1))
+        # Translate the existing position by the outer-frame displacement.
+        # This includes the title bar and supports monitors at negative x/y.
+        self.move(self.x() + x - frame.left(), self.y() + y - frame.top())
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        QTimer.singleShot(0, self._place_after_show)
+
+    def _place_after_show(self) -> None:
+        if self.isVisible():
+            self.ensure_on_screen(center=not getattr(self, "_has_been_shown", False))
+            self._has_been_shown = True
 
     def _remove_legacy_interval_group(self) -> None:
         try:
@@ -1704,79 +1895,22 @@ class MainSettingsDialog(LegacyStockWidget.SettingsDialog):
     def _insert_risk_tab(self) -> None:
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        cfg = self.owner.store.risk_config()
-
-        risk_box = QGroupBox("下单风控")
+        self.owner.store.risk_config()
+        risk_box = QGroupBox("委托与账户规则")
         form = QFormLayout(risk_box)
-        self.risk_enabled = QCheckBox("启用下单前风控校验")
-        self.risk_enabled.setChecked(bool(cfg.get("enabled", True)))
-        self.risk_block_st = QCheckBox("禁止买入 ST 风险股")
-        self.risk_block_st.setChecked(bool(cfg.get("block_st_buy", True)))
-        self.risk_block_chasing = QCheckBox("不追高")
-        self.risk_block_chasing.setChecked(bool(cfg.get("block_chasing_high", True)))
-        self.risk_reduce_only_loss = QCheckBox("亏损持仓只减不加")
-        self.risk_reduce_only_loss.setChecked(bool(cfg.get("loss_position_reduce_only", True)))
-        self.risk_near_close = QCheckBox("临近收盘禁止开新仓")
-        self.risk_near_close.setChecked(bool(cfg.get("block_new_position_near_close", True)))
-
-        self.risk_max_position = QDoubleSpinBox()
-        self.risk_max_position.setRange(1.0, 100.0)
-        self.risk_max_position.setDecimals(1)
-        self.risk_max_position.setSuffix("%")
-        self.risk_max_position.setValue(float(cfg.get("max_position_pct", 65.0)))
-
-        self.risk_max_buy = QDoubleSpinBox()
-        self.risk_max_buy.setRange(1.0, 100.0)
-        self.risk_max_buy.setDecimals(1)
-        self.risk_max_buy.setSuffix("%")
-        self.risk_max_buy.setValue(float(cfg.get("max_single_buy_pct", 25.0)))
-
-        self.risk_max_buy_change = QDoubleSpinBox()
-        self.risk_max_buy_change.setRange(0.5, 20.0)
-        self.risk_max_buy_change.setDecimals(1)
-        self.risk_max_buy_change.setSuffix("%")
-        self.risk_max_buy_change.setValue(float(cfg.get("max_buy_change_pct", 7.0)))
-
-        self.risk_loss_threshold = QDoubleSpinBox()
-        self.risk_loss_threshold.setRange(-50.0, 0.0)
-        self.risk_loss_threshold.setDecimals(1)
-        self.risk_loss_threshold.setSuffix("%")
-        self.risk_loss_threshold.setValue(float(cfg.get("loss_position_threshold_pct", -3.0)))
-
-        self.risk_near_close_minutes = QSpinBox()
-        self.risk_near_close_minutes.setRange(1, 60)
-        self.risk_near_close_minutes.setValue(int(cfg.get("near_close_minutes", 15)))
-
         self.risk_max_pending = QSpinBox()
-        self.risk_max_pending.setRange(1, 20)
-        self.risk_max_pending.setValue(int(cfg.get("max_pending_per_code", 3)))
-
-        form.addRow("", self.risk_enabled)
-        form.addRow("", self.risk_block_st)
-        form.addRow("", self.risk_block_chasing)
-        form.addRow("", self.risk_reduce_only_loss)
-        form.addRow("", self.risk_near_close)
-        form.addRow("单票最大仓位", self.risk_max_position)
-        form.addRow("单笔最大买入", self.risk_max_buy)
-        form.addRow("追高阈值", self.risk_max_buy_change)
-        form.addRow("亏损加仓阈值", self.risk_loss_threshold)
-        form.addRow("收盘前分钟", self.risk_near_close_minutes)
-        form.addRow("同代码活动委托上限", self.risk_max_pending)
+        self.risk_max_pending.setRange(MAX_PENDING_PER_CODE, MAX_PENDING_PER_CODE)
+        self.risk_max_pending.setValue(MAX_PENDING_PER_CODE)
+        self.risk_max_pending.setEnabled(False)
+        form.addRow("同一证券活动委托最多", self.risk_max_pending)
+        detail = QLabel("同一证券的买卖活动委托合计最多 3 条，成交或撤单后释放名额。"
+                        "买入按明确股数提交，不因仓位比例或预算自动缩量。"
+                        "资金、冻结金额、可卖数量、交易时段、T+1、申报数量和有效行情仍按账户规则校验。")
+        detail.setWordWrap(True)
+        form.addRow(detail)
         layout.addWidget(risk_box)
         layout.addStretch(1)
-
-        self.risk_enabled.toggled.connect(self._on_risk_changed)
-        self.risk_block_st.toggled.connect(self._on_risk_changed)
-        self.risk_block_chasing.toggled.connect(self._on_risk_changed)
-        self.risk_reduce_only_loss.toggled.connect(self._on_risk_changed)
-        self.risk_near_close.toggled.connect(self._on_risk_changed)
-        self.risk_max_position.valueChanged.connect(self._on_risk_changed)
-        self.risk_max_buy.valueChanged.connect(self._on_risk_changed)
-        self.risk_max_buy_change.valueChanged.connect(self._on_risk_changed)
-        self.risk_loss_threshold.valueChanged.connect(self._on_risk_changed)
-        self.risk_near_close_minutes.valueChanged.connect(self._on_risk_changed)
-        self.risk_max_pending.valueChanged.connect(self._on_risk_changed)
-        self.tabs.insertTab(1, tab, "风控")
+        self.tabs.insertTab(1, tab, "委托规则")
 
     def _insert_compact_display_limit_group(self) -> None:
         display_tab = self.tabs.widget(2)
@@ -1862,21 +1996,7 @@ class MainSettingsDialog(LegacyStockWidget.SettingsDialog):
         self.tabs.insertTab(2, tab, "策略组合")
 
     def _on_risk_changed(self, *_args: Any) -> None:
-        self.owner.store.set_risk_config(
-            {
-                "enabled": self.risk_enabled.isChecked(),
-                "block_st_buy": self.risk_block_st.isChecked(),
-                "block_chasing_high": self.risk_block_chasing.isChecked(),
-                "max_buy_change_pct": float(self.risk_max_buy_change.value()),
-                "loss_position_reduce_only": self.risk_reduce_only_loss.isChecked(),
-                "loss_position_threshold_pct": float(self.risk_loss_threshold.value()),
-                "block_new_position_near_close": self.risk_near_close.isChecked(),
-                "near_close_minutes": int(self.risk_near_close_minutes.value()),
-                "max_position_pct": float(self.risk_max_position.value()),
-                "max_single_buy_pct": float(self.risk_max_buy.value()),
-                "max_pending_per_code": int(self.risk_max_pending.value()),
-            }
-        )
+        self.owner.store.set_risk_config({"max_pending_per_code": MAX_PENDING_PER_CODE})
         self.owner.render_all()
 
     def _on_strategy_toggled(self, strategy_id: str, checked: bool) -> None:
@@ -2028,6 +2148,7 @@ class MainWindow(QMainWindow):
         self._build_tray()
         app = QApplication.instance()
         if app is not None:
+            app.aboutToQuit.connect(self.save_main_window_state)
             app.aboutToQuit.connect(self.shutdown_compact)
         self.timer = QTimer(self)
         self.timer.timeout.connect(lambda: self.refresh_quotes(auto=True))
@@ -2039,6 +2160,20 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(700, lambda: self.refresh_quotes(auto=True))
         QTimer.singleShot(1800, self.preload_compact_window)
         QTimer.singleShot(12000, self.refresh_stale_daily_klines)
+        self._main_window_state = MainWindowState(self, self.store.data.get("main_window"))
+
+    def show_restored_window(self) -> None:
+        self._main_window_state.show_restored()
+
+    def save_main_window_state(self) -> None:
+        state = getattr(self, "_main_window_state", None)
+        if state is not None:
+            self.store.data["main_window"] = state.snapshot()
+            self.store.save()
+
+    def closeEvent(self, event) -> None:
+        event.ignore()
+        self.quit_app()
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -2055,7 +2190,7 @@ class MainWindow(QMainWindow):
 
         brand = QLabel("AIStockSim")
         brand.setObjectName("BrandTitle")
-        subtitle = QLabel("2.0 工作台")
+        subtitle = QLabel(f"{APP_VERSION} · 浅色模式")
         subtitle.setObjectName("BrandSubtitle")
         nav_layout.addWidget(brand)
         nav_layout.addWidget(subtitle)
@@ -2631,6 +2766,9 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(content)
         tab.setWidget(content)
 
+        self.local_strategy_panel = LocalStrategyPanel(self)
+        layout.addWidget(self.local_strategy_panel)
+
         catalog_box = QGroupBox("策略组合目录")
         catalog_layout = QVBoxLayout(catalog_box)
         catalog_hint = QLabel("这些策略可在“设置 - 策略组合”中启用/停用；启用项会写入 strategy_context，供用户和外部 AI 同步读取。")
@@ -2648,7 +2786,7 @@ class MainWindow(QMainWindow):
         catalog_layout.addWidget(self.strategy_catalog_table)
         layout.addWidget(catalog_box)
 
-        canslim_box = QGroupBox("CAN SLIM 纪律雷达")
+        canslim_box = QGroupBox("CAN SLIM 价格量能参考（与缠论独立）")
         canslim_layout = QVBoxLayout(canslim_box)
         canslim_hint = QLabel("按市场闸门、趋势、相对强弱、资金需求、买点质量和卖出纪律给自选/持仓分桶。基本面未接入时会明确标记缺项。")
         canslim_hint.setWordWrap(True)
@@ -3042,14 +3180,14 @@ class MainWindow(QMainWindow):
     def _style(self) -> None:
         self.setStyleSheet(
             """
-            QMainWindow { background: #f7f8fa; }
+            QMainWindow { background: #f7f8fa; color: #17202a; }
             #NavPanel { background: #202833; border-right: 1px solid #131820; }
             #BrandTitle { color: #ffffff; font-size: 19px; font-weight: 700; }
             #BrandSubtitle { color: #aeb8c6; font-size: 12px; }
             #MainNav { background: transparent; border: 0; color: #dfe6ee; font-size: 14px; }
             #MainNav::item { padding: 10px 9px; border-radius: 5px; }
-            #MainNav::item:selected { background: #2f80ed; color: #ffffff; }
             #MainNav::item:hover { background: #344255; }
+            #MainNav::item:selected { background: #2563eb; color: #ffffff; }
             #PageTitle { font-size: 20px; font-weight: 700; color: #17202a; }
             #PageHint { color: #697386; font-size: 13px; }
             #SectionTitle { font-size: 16px; font-weight: 700; color: #17202a; margin-top: 8px; }
@@ -3057,12 +3195,19 @@ class MainWindow(QMainWindow):
             #MetricTitle { color: #6b7280; font-size: 12px; }
             #MetricValue { color: #17202a; font-size: 19px; font-weight: 700; }
             #MetricHint { color: #697386; font-size: 12px; }
-            QGroupBox { font-weight: 600; border: 1px solid #d6dae0; border-radius: 6px; margin-top: 12px; padding: 10px; background: #ffffff; }
+            QGroupBox { color: #17202a; font-weight: 600; border: 1px solid #d6dae0; border-radius: 6px; margin-top: 12px; padding: 10px; background: #ffffff; }
             QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
-            QTableWidget { background: #ffffff; border: 1px solid #d6dae0; gridline-color: #edf0f3; }
-            QPushButton { padding: 6px 12px; border: 1px solid #b8c0cc; border-radius: 5px; background: #ffffff; }
+            QTableWidget { color: #17202a; background: #ffffff; alternate-background-color: #f1f5f9; selection-background-color: #2563eb; selection-color: #ffffff; border: 1px solid #d6dae0; gridline-color: #edf0f3; }
+            QHeaderView::section { color: #374151; background: #eef2f7; border: 0; border-right: 1px solid #d6dae0; border-bottom: 1px solid #d6dae0; padding: 5px; }
+            QPushButton { color: #17202a; padding: 6px 12px; border: 1px solid #b8c0cc; border-radius: 5px; background: #ffffff; }
             QPushButton:hover { background: #f0f4f8; }
-            QLineEdit, QSpinBox, QDoubleSpinBox, QPlainTextEdit, QComboBox { padding: 5px; border: 1px solid #b8c0cc; border-radius: 4px; background: #ffffff; }
+            QPushButton:pressed, QPushButton:checked { background: #dbeafe; border-color: #2563eb; }
+            QPushButton:focus { border-color: #2563eb; }
+            QLineEdit, QPlainTextEdit { color: #17202a; padding: 5px; border: 1px solid #b8c0cc; border-radius: 4px; background: #ffffff; selection-background-color: #2563eb; selection-color: #ffffff; }
+            QLineEdit:focus, QPlainTextEdit:focus { border-color: #2563eb; }
+            QSpinBox, QDoubleSpinBox, QComboBox { min-height: 28px; }
+            QComboBox QAbstractItemView { color: #17202a; background: #ffffff; selection-background-color: #2563eb; selection-color: #ffffff; }
+            QPushButton:disabled, QLineEdit:disabled, QPlainTextEdit:disabled { color: #697386; background: #f1f5f9; border-color: #d6dae0; }
             """
         )
 
@@ -3142,6 +3287,9 @@ class MainWindow(QMainWindow):
     def open_main_settings(self) -> None:
         self.ensure_compact_window()
         if self._settings_dialog is not None and self._settings_dialog.isVisible():
+            if self._settings_dialog.isMinimized():
+                self._settings_dialog.showNormal()
+            self._settings_dialog.ensure_on_screen()
             self._settings_dialog.raise_()
             self._settings_dialog.activateWindow()
             return
@@ -3403,6 +3551,14 @@ class MainWindow(QMainWindow):
             self.compact_window.hide()
 
     def quit_app(self) -> None:
+        panel = getattr(self, "local_strategy_panel", None)
+        worker = getattr(panel, "worker", None)
+        if worker is not None and worker.isRunning():
+            worker.requestInterruption()
+            self.status.setText("正在停止离线回测，完成当前股票后退出…")
+            QTimer.singleShot(200, self.quit_app)
+            return
+        self.save_main_window_state()
         self._closing = True
         try:
             self.timer.stop()
@@ -3532,6 +3688,7 @@ class MainWindow(QMainWindow):
                 self.refresh_daily_klines(codes, force=not auto)
                 self.refresh_intraday_points(codes, force=not auto)
             executed = self.try_execute_pending_orders()
+            self.local_strategy_panel.on_quotes_refreshed()
             mode = "启动轻量刷新" if light_startup else "自动刷新" if auto else "手动刷新"
             suffix = f"，成交 {executed} 笔委托" if executed else ""
             self.status.setText(f"{mode}：{now_str()}，返回 {len(fetched)} 个代码{suffix}")
@@ -3564,27 +3721,42 @@ class MainWindow(QMainWindow):
     def refresh_daily_klines(self, codes: list[str], force: bool = False) -> None:
         now = dt.datetime.now()
         if not force and self._daily_kline_last_fetch is not None:
-            if (now - self._daily_kline_last_fetch).total_seconds() < 1800:
+            if (now - self._daily_kline_last_fetch).total_seconds() < 20:
                 return
+        # Per-symbol freshness and rotating bounded batches prevent a large
+        # watchlist (or a failing first symbol) from starving later symbols.
+        universe = list(dict.fromkeys(norm for code in codes if (norm := normalize_code(code))))
+        fetched_at = getattr(self, "_daily_kline_fetched_at", {})
+        attempted_at = getattr(self, "_daily_kline_attempted_at", {})
+        self._daily_kline_fetched_at = fetched_at
+        self._daily_kline_attempted_at = attempted_at
         requested: list[str] = []
-        today = today_str()
-        for code in codes:
-            norm = normalize_code(code)
-            if norm and norm not in requested:
-                if not force:
-                    cached = self.daily_kline_cache.get(norm) or []
-                    if cached and str(cached[-1].date or "") >= today:
-                        continue
-                requested.append(norm)
-        requested = requested[:16]
+        start = getattr(self, "_daily_kline_cursor", 0) % len(universe) if universe else 0
+        for offset in range(len(universe)):
+            index = (start + offset) % len(universe)
+            code = universe[index]
+            successful = fetched_at.get(code)
+            attempted = attempted_at.get(code)
+            if not force and successful and (now - successful).total_seconds() < 1800:
+                continue
+            if not force and attempted and (now - attempted).total_seconds() < 60:
+                continue
+            requested.append(code)
+            self._daily_kline_cursor = (index + 1) % len(universe)
+            if not force and len(requested) >= 4:
+                break
         if not requested:
-            self._daily_kline_last_fetch = now
             return
         self._daily_kline_last_fetch = now
+        for code in requested:
+            attempted_at[code] = now
         try:
             rows = self.quotes.fetch_daily_klines(requested)
             if rows:
                 self.daily_kline_cache.update(rows)
+                for code, bars in rows.items():
+                    if bars:
+                        fetched_at[code] = now
                 self.write_codex_kline_history()
         except Exception:
             return
@@ -3602,14 +3774,13 @@ class MainWindow(QMainWindow):
         if not force and self._intraday_last_fetch is not None:
             if (now - self._intraday_last_fetch).total_seconds() < max(20, self.store.refresh_seconds):
                 return
-        requested: list[str] = []
-        for code in codes:
-            norm = normalize_code(code)
-            if norm and norm not in requested:
-                requested.append(norm)
-        requested = requested[:16]
+        universe = list(dict.fromkeys(norm for code in codes if (norm := normalize_code(code))))
+        start = getattr(self, "_intraday_cursor", 0) % len(universe) if universe else 0
+        rotated = universe[start:] + universe[:start]
+        requested = rotated if force else rotated[:4]
         if not requested:
             return
+        self._intraday_cursor = (start + len(requested)) % len(universe)
         self._intraday_last_fetch = now
         try:
             rows = self.quotes.fetch_intraday_points(requested)
@@ -3624,23 +3795,15 @@ class MainWindow(QMainWindow):
         self.write_codex_snapshot()
 
     def overview_risk_summary(self, positions: dict[str, dict[str, Any]], summary: dict[str, float]) -> tuple[str, float]:
-        warnings: list[str] = []
-        max_weight = 0.0
-        equity = summary["equity"]
-        for code, item in positions.items():
-            quote = self.quote_cache.get(code)
-            price = quote.price if quote else float(item.get("breakeven_cost") or item.get("avg_cost") or 0)
-            weight = price * int(item.get("qty") or 0) / equity * 100 if equity else 0.0
-            max_weight = max(max_weight, weight)
-            risk = self.risk_signal_for_code(code, quote)
-            if any(key in risk for key in ("ST", "超仓", "接近上限")):
-                warnings.append(f"{code} {risk}")
-        active_orders = len(self.store.active_pending_orders())
-        if active_orders:
-            warnings.append(f"{active_orders} 条活动委托")
-        if not warnings:
-            return "风险可控", 0.0
-        return "；".join(warnings[:4]), -1.0
+        counts: dict[str, int] = {}
+        for order in self.store.active_pending_orders():
+            code = str(order.get("code") or "")
+            counts[code] = counts.get(code, 0) + 1
+        full = [f"{code} 活动委托 {count}/{MAX_PENDING_PER_CODE}" for code, count in counts.items()
+                if count >= MAX_PENDING_PER_CODE]
+        if full:
+            return "；".join(full[:4]), -1.0
+        return f"活动委托 {sum(counts.values())} 条；可用资金 {money(summary.get('available_cash', self.store.available_cash()))}", 0.0
 
     def record_price_history(self, quotes: dict[str, Quote]) -> None:
         stamp = now_str()
@@ -3955,6 +4118,7 @@ class MainWindow(QMainWindow):
 
         recent_20 = valid_rows[-20:] if len(valid_rows) >= 20 else valid_rows
         recent_60 = valid_rows[-60:] if len(valid_rows) >= 60 else valid_rows
+        completed_60 = [item for item in valid_rows if str(item.date) < today_str()][-60:]
         support_candidates = [float(item.low) for item in recent_60 if 0 < float(item.low) <= close]
         resistance_candidates = [float(item.high) for item in recent_60 if float(item.high) >= close]
         support = max(support_candidates) if support_candidates else min(lows[-60:] if len(lows) >= 60 else lows)
@@ -4019,6 +4183,7 @@ class MainWindow(QMainWindow):
             "high_20": round(max(float(item.high) for item in recent_20), 4) if recent_20 else None,
             "low_20": round(min(float(item.low) for item in recent_20), 4) if recent_20 else None,
             "high_60": round(max(float(item.high) for item in recent_60), 4) if recent_60 else None,
+            "prior_high_60": round(max(float(item.high) for item in completed_60), 4) if completed_60 else None,
             "low_60": round(min(float(item.low) for item in recent_60), 4) if recent_60 else None,
             "gap": gap,
             "return_20": round(last_20_return, 2),
@@ -4245,7 +4410,7 @@ class MainWindow(QMainWindow):
         enabled = [item for item in self.active_strategy_definitions() if item.get("enabled")]
         disabled = [str(item.get("id")) for item in self.active_strategy_definitions() if not item.get("enabled")]
         return {
-            "name": "CAN SLIM 纪律组合",
+            "name": "本地缠论笔结构 + 独立趋势参考 + 执行风控",
             "version": APP_VERSION,
             "enabled_ids": [str(item.get("id")) for item in enabled],
             "disabled_ids": disabled,
@@ -4253,15 +4418,16 @@ class MainWindow(QMainWindow):
             "ai_onboarding": {
                 "read_first": [
                     "先读 strategy_pack.enabled_definitions，确认用户启用哪些策略。",
-                    "再读 market_gate，市场红灯时不提出新开多仓。",
-                    "随后读 canslim_radar，按分桶、评分、买点质量、卖出纪律给结论。",
+                    "缠论笔结构候选见 local_structure；不把CAN SLIM近新高/均线强势要求强加给结构二买。",
+                    "仅在用户启用时读取 market_gate，其颜色属于市场观察，不作为开仓否决。",
+                    "只有用户启用 canslim_radar 时才读取其分桶和评分作为独立参考，不要求缠论信号同时满足它。",
                     "最后结合 risk_audit、pending_orders、cash、T+1 和每手规则形成候选指令。",
                 ],
                 "must_not": [
                     "不要只根据今日涨跌幅下单。",
                     "不要把缺失的 EPS、营收、ROE 或机构持仓数据编造成已验证事实。",
-                    "不要给亏损弱势持仓无条件补仓建议。",
-                    "没有明确失效条件、委托价和数量规则时不要输出买入候选指令。",
+                    "不要将持仓、亏损、ST、涨幅或仓位比例用作额外下单限制。",
+                    "候选指令必须给出有效委托价和明确股数；同一证券活动委托最多3条，不自动缩量。",
                 ],
                 "preferred_output": "结论、证据、操作、风险四段式；候选 JSON 指令只能作为待审批建议。",
             },
@@ -4277,7 +4443,7 @@ class MainWindow(QMainWindow):
                 codes.append(norm)
         return codes
 
-    def market_gate_profile(self) -> dict[str, Any]:
+    def market_gate_profile(self, code: str | None = None) -> dict[str, Any]:
         enabled = self.strategy_enabled("market_gate")
         if not enabled:
             return {
@@ -4287,6 +4453,18 @@ class MainWindow(QMainWindow):
                 "score": 0,
                 "new_long_allowed": True,
                 "summary": "用户已关闭市场环境闸门。",
+                "indices": [],
+            }
+
+        if code and code.startswith("hk"):
+            return {
+                "enabled": True,
+                "market": "hk",
+                "gate": "unknown",
+                "label": "港股数据缺失",
+                "score": 0,
+                "new_long_allowed": True,
+                "summary": "尚未接入港股基准指数，港股市场环境未验证；不使用 A 股指数作港股开仓的硬否决。",
                 "indices": [],
             }
 
@@ -4352,8 +4530,8 @@ class MainWindow(QMainWindow):
                 "gate": "unknown",
                 "label": "黄灯",
                 "score": 0,
-                "new_long_allowed": False,
-                "summary": "指数样本不足，按保守状态处理。",
+                "new_long_allowed": True,
+                "summary": "指数样本不足，市场环境未知，仅展示数据缺项。",
                 "indices": [],
             }
 
@@ -4366,12 +4544,12 @@ class MainWindow(QMainWindow):
         elif avg_score <= -0.45:
             gate = "red"
             label = "红灯"
-            summary = "市场环境偏弱，策略建议不新开多仓，优先控制风险。"
-            new_long_allowed = False
+            summary = "市场环境偏弱，仅作为指数趋势观察，不限制下单。"
+            new_long_allowed = True
         else:
             gate = "yellow"
             label = "黄灯"
-            summary = "市场环境一般，只适合小仓试错或等待更清晰买点。"
+            summary = "市场环境一般，仅作为指数趋势观察，不限制下单股数。"
             new_long_allowed = True
         return {
             "enabled": True,
@@ -4407,13 +4585,18 @@ class MainWindow(QMainWindow):
 
     def canslim_profile_for_code(self, code: str, quote: Quote | None, market_gate: dict[str, Any] | None = None) -> dict[str, Any]:
         norm = normalize_code(code) or code
+        if not self.strategy_enabled("canslim_radar"):
+            return {"enabled": False, "code": norm, "name": quote.name if quote else norm,
+                    "score": None, "light": "未启用", "bucket": "未启用", "setup": "未启用",
+                    "risk": "", "action": "用户未启用 CAN SLIM 参考", "components": {},
+                    "warnings": [], "evidence": [], "missing": []}
         positions = self.store.positions()
         item = positions.get(norm) or {}
         qty = int(item.get("qty") or 0)
         technical = self.technical_profile(norm)
         intraday = self.intraday_profile(norm)
         flow = self.money_flow_cache.get(norm)
-        market_gate = market_gate or self.market_gate_profile()
+        market_gate = self.market_gate_profile(norm) if norm.startswith("hk") else (market_gate or self.market_gate_profile(norm))
         price = quote.price if quote else float(technical.get("last_close") or item.get("breakeven_cost") or item.get("avg_cost") or 0)
         name = quote.name if quote else str(item.get("name") or norm)
         is_st = "ST" in name.upper()
@@ -4423,6 +4606,8 @@ class MainWindow(QMainWindow):
         portfolio_enabled = self.strategy_enabled("portfolio_risk")
 
         missing = ["C/A 基本面未接入：EPS、营收、ROE 需人工或外部数据确认"]
+        if norm.startswith("hk") and market_gate.get("gate") == "unknown":
+            missing.append("M 港股基准指数未接入，不能根据 A 股指数判断港股市场环境")
         evidence: list[str] = []
         warning: list[str] = []
 
@@ -4515,23 +4700,23 @@ class MainWindow(QMainWindow):
             setup_score = 55
             setup_text = "买点纪律未启用，仅展示候选强弱"
         elif technical.get("status") == "ok" and price > 0:
-            high_60 = float(technical.get("high_60") or 0)
+            high_60 = float(technical.get("prior_high_60") or 0)
             ma = technical.get("ma") if isinstance(technical.get("ma"), dict) else {}
             ma20 = float(ma.get("ma20") or 0)
             ma60 = float(ma.get("ma60") or 0)
             volume_ratio = float(technical.get("volume_ratio_5_20") or 0)
             near_high = bool(high_60 and price >= high_60 * 0.97)
             above_ma = bool((ma20 and price >= ma20) or (ma60 and price >= ma60))
-            if near_high and volume_ratio >= 1.2:
+            if high_60 and price > high_60 * 1.05:
+                setup_score = 35
+                setup_text = "距离近端高位偏远，谨慎追高"
+                warning.append("可能偏离买点")
+            elif near_high and volume_ratio >= 1.2:
                 setup_score = 82
                 setup_text = "接近60日高位且有量，关注突破/回踩买点"
             elif above_ma and ((not intraday_enabled) or intraday.get("above_vwap")):
                 setup_score = 68
                 setup_text = "均线修复，等待确认" if not intraday_enabled else "均线修复且分时站上VWAP，等待确认"
-            elif high_60 and price > high_60 * 1.05:
-                setup_score = 35
-                setup_text = "距离近端高位偏远，谨慎追高"
-                warning.append("可能偏离买点")
             elif ma20 and price < ma20:
                 setup_score = 35
                 setup_text = "低于MA20，等待修复"
@@ -4558,7 +4743,7 @@ class MainWindow(QMainWindow):
                     warning.append("止损复核")
                 elif drawdown <= -4:
                     risk_score = 32
-                    risk_text = f"较回本价 {drawdown:.1f}%，亏损持仓只减不加"
+                    risk_text = f"较回本价 {drawdown:.1f}%，持仓浮亏观察"
                     warning.append("亏损持仓")
                 elif drawdown >= 20:
                     risk_score = 68
@@ -4568,11 +4753,8 @@ class MainWindow(QMainWindow):
                     risk_score = 58
             equity = self.account_equity_estimate()
             weight = price * qty / equity * 100 if equity and price else 0
-            max_position = float(self.store.risk_config().get("max_position_pct", 65.0))
-            if portfolio_enabled and weight >= max_position:
-                risk_score = min(risk_score, 25)
-                risk_text += f"；单票仓位 {weight:.1f}% 超上限"
-                warning.append("超仓")
+            if portfolio_enabled:
+                risk_text += f"；单票仓位 {weight:.1f}%"
 
         components = {
             "market": market_score,
@@ -4606,13 +4788,13 @@ class MainWindow(QMainWindow):
             bucket = "弱势/剔除"
 
         if gate == "red":
-            action = "市场红灯，不新开多仓；只做持仓风险管理。"
+            action = "市场环境偏弱，说明依据与数据缺项；不作为交易否决。"
             light = "红灯"
         elif components["risk"] <= 35 and qty > 0:
-            action = "优先复核减仓/止损条件，不做补仓。"
+            action = "复核持仓盈亏和退出条件；继续买入仍按用户启用策略判断。"
             light = "红灯"
         elif score >= 75 and setup_score >= 65:
-            action = "可列入近买点观察，仍需限价、仓位和T+1预审。"
+            action = "可列入近买点观察，成交需满足限价、资金、数量和T+1规则。"
             light = "绿灯"
         elif score >= 55:
             action = "继续观察，等待买点或分时确认。"
@@ -4651,25 +4833,13 @@ class MainWindow(QMainWindow):
         return rows
 
     def risk_signal_for_code(self, code: str, quote: Quote | None) -> str:
-        cfg = self.store.risk_config()
-        if not cfg.get("enabled", True):
-            return "风控关闭"
-        quote_name = quote.name if quote else code
-        if cfg.get("block_st_buy", True) and "ST" in str(quote_name).upper():
-            return "ST限制买入"
-        positions = self.store.positions()
-        item = positions.get(code) or {}
+        item = self.store.positions().get(code) or {}
         qty = int(item.get("qty") or 0)
         if not qty:
             return "无持仓"
         price = quote.price if quote else float(item.get("breakeven_cost") or item.get("avg_cost") or 0)
         equity = self.account_equity_estimate()
         weight = price * qty / equity * 100 if equity else 0.0
-        max_position = float(cfg.get("max_position_pct", 65.0))
-        if weight >= max_position:
-            return f"超仓 {weight:.0f}%"
-        if weight >= max_position * 0.8:
-            return f"接近上限 {weight:.0f}%"
         return f"仓位 {weight:.0f}%"
 
     def agent_market_rows(self) -> list[dict[str, Any]]:
@@ -4745,6 +4915,7 @@ class MainWindow(QMainWindow):
             "note": "These are deterministic local strategy/risk signals for the AI to analyze. They are not an AI-generated conclusion.",
             "generated_at": now_str(),
             "strategy_pack": self.strategy_pack_context(),
+            "local_structure": self.local_strategy_panel.context(),
             "strategy_catalog": self.strategy_catalog_rows(),
             "historical_data": self.historical_data_summary(),
             "market_gate": self.market_gate_profile(),
@@ -4793,10 +4964,8 @@ class MainWindow(QMainWindow):
         equity = float(summary.get("equity") or 0)
         if reserved > 0:
             add("现金/冻结", "有冻结资金", f"可用 {money(available_cash)}，买入委托冻结 {money(reserved)}。", -0.2)
-        elif equity and available_cash / equity < 0.05:
-            add("现金/冻结", "现金偏低", f"可用资金 {money(available_cash)}，低于总资产 5%。", -0.3)
         else:
-            add("现金/冻结", "充足", f"可用资金 {money(available_cash)}。", 0.8)
+            add("现金/冻结", "可用余额", f"可用资金 {money(available_cash)}，按完整委托金额校验。", 0.0)
 
         max_weight = 0.0
         max_code = ""
@@ -4808,13 +4977,7 @@ class MainWindow(QMainWindow):
             if weight > max_weight:
                 max_weight = weight
                 max_code = code
-        max_position = float(self.store.risk_config().get("max_position_pct", 65.0))
-        if max_weight >= max_position:
-            add("持仓集中度", "超出上限", f"{max_code} 仓位约 {max_weight:.1f}%，上限 {max_position:.1f}%。", -1.0)
-        elif max_weight >= max_position * 0.8:
-            add("持仓集中度", "接近上限", f"{max_code} 仓位约 {max_weight:.1f}%。", -0.5)
-        else:
-            add("持仓集中度", "可控", f"最高单票仓位 {max_weight:.1f}%。", 0.5)
+        add("持仓集中度", "比例观察", f"最高单票 {max_code or '-'} 仓位约 {max_weight:.1f}%，无比例上限。", 0.0)
 
         qty_total = sum(int(item.get("qty") or 0) for item in positions.values())
         sellable_total = sum(int(item.get("available") or 0) for item in positions.values())
@@ -4830,9 +4993,7 @@ class MainWindow(QMainWindow):
         else:
             add("活动委托", "无", "没有未成交委托占用资金或仓位。", 0.5)
 
-        cfg = self.store.risk_config()
-        st_status = "开启" if cfg.get("block_st_buy", True) else "关闭"
-        add("ST 买入限制", st_status, "开启时，ST 股票买入会被风控拦截。" if st_status == "开启" else "关闭后需自行承担 ST 风险。", 0.5 if st_status == "开启" else -0.8)
+        add("委托数量", "固定上限", "同一证券买卖活动委托合计最多3条；成交或撤单后释放名额。", 0.0)
 
         ai = self.store.data.get("ai") or {}
         if ai.get("api_key"):
@@ -4844,59 +5005,26 @@ class MainWindow(QMainWindow):
     def rebalance_suggestions(self) -> list[dict[str, Any]]:
         summary = self.account_summary()
         equity = float(summary.get("equity") or 0)
-        available_cash = float(summary.get("available_cash") or 0)
-        cfg = self.store.risk_config()
-        max_position = float(cfg.get("max_position_pct", 65.0))
         rows: list[dict[str, Any]] = []
 
         def add(target: str, suggestion: str, reason: str, condition: str, usage: str, priority: float = 0.0) -> None:
-            rows.append(
-                {
-                    "target": target,
-                    "suggestion": suggestion,
-                    "reason": reason,
-                    "condition": condition,
-                    "usage": usage,
-                    "priority": priority,
-                }
-            )
+            rows.append({"target": target, "suggestion": suggestion, "reason": reason,
+                         "condition": condition, "usage": usage, "priority": priority})
 
-        positions = self.store.positions()
-        if not positions:
-            add("组合", "等待建仓", "当前没有持仓。", "先添加自选并观察策略信号。", "组合经理可生成观察清单。", 0.0)
-
-        for code, item in positions.items():
+        for code, item in self.store.positions().items():
             quote = self.quote_cache.get(code)
             price = quote.price if quote else float(item.get("breakeven_cost") or item.get("avg_cost") or 0)
             qty = int(item.get("qty") or 0)
-            value = price * qty
-            weight = value / equity * 100 if equity else 0.0
-            name = quote.name if quote else str(item.get("name") or code)
-            breakeven = float(item.get("breakeven_cost") or item.get("avg_cost") or 0)
-            floating = (price - breakeven) * qty if qty and breakeven else 0.0
-            available = int(item.get("available") or 0)
-            label = f"{code} {name}"
-            if weight >= max_position:
-                add(label, "优先降仓", f"单票仓位 {weight:.1f}% 已超过风控上限 {max_position:.1f}%。", "反弹或 AI 确认弱势时分批降低集中度。", "风险经理/组合经理必须优先处理。", -1.0)
-            elif weight >= max_position * 0.8:
-                add(label, "控制加仓", f"单票仓位 {weight:.1f}% 接近上限。", "除非趋势和资金流同时改善，否则不追加仓位。", "组合经理给买入建议时需解释集中度。", -0.5)
-            if floating < 0 and breakeven and price / breakeven - 1 <= -0.08:
-                add(label, "复核止损", f"较摊余回本价浮亏约 {pct(price / breakeven * 100 - 100)}。", "若反弹无量或风险审计转弱，优先确认减仓条件。", "风险经理需要给出是否继续承受回撤。", -0.7)
-            if "ST" in str(name).upper():
-                add(label, "风险票观察", "名称包含 ST，买入受限且波动风险更高。", "只考虑可卖仓位的风险释放，不做盲目补仓。", "新闻/情绪和风险经理必须单独说明。", -0.8)
-            if qty and available <= 0:
-                add(label, "T+1 等待", "当前持仓暂无可卖数量。", "等待下一交易日可卖后再执行减仓计划。", "候选卖出指令会被可卖数量预审拦截。", -0.2)
-
-        if equity and available_cash / equity < 0.05:
-            add("现金", "保留流动性", f"可用资金仅占总资产 {available_cash / equity * 100:.1f}%。", "除非出现高胜率机会，否则减少新增买入。", "组合经理应优先给出持有/减仓而非补仓。", -0.4)
-        elif equity and available_cash / equity >= 0.2:
-            add("现金", "可等待机会", f"可用资金占总资产 {available_cash / equity * 100:.1f}%。", "仅在趋势、资金流、风险审计都支持时分批试错。", "组合经理可提出低仓位试探条件。", 0.3)
-
+            weight = price * qty / equity * 100 if equity else 0.0
+            available = self.store.available_sell_qty(code)
+            add(code, "持仓观察", f"持仓 {qty} 股，仓位 {weight:.1f}%，剩余可卖 {available} 股。",
+                "根据启用策略和有效行情判断买卖条件。", "持仓比例、浮亏和 ST 标签不构成买入限制。")
+        add("现金", "可用资金", f"可用 {money(summary.get('available_cash', 0))}；冻结 {money(summary.get('reserved', 0))}。",
+            "按明确股数和限价校验足额资金，不自动缩量。", "实际资金不足时说明缺口。")
         active_orders = self.store.active_pending_orders()
         if active_orders:
-            add("未成交委托", "复核挂单", f"当前有 {len(active_orders)} 条活动委托。", "行情刷新后检查是否仍符合触发条件。", "AI 候选改价/撤单需先匹配活动委托。", -0.2)
-        if not rows:
-            add("组合", "保持观察", "仓位、现金和委托暂未触发明显再平衡条件。", "等待趋势/资金流或 AI 报告给出新证据。", "组合经理可以维持 hold。", 0.2)
+            add("未成交委托", "持续待撮合", f"当前有 {len(active_orders)} 条活动委托，同一证券最多 3 条。",
+                "达到限价且符合基本成交规则时撮合，用户可撤单或改单。", "修改委托应优先引用 order_id。")
         return rows[:12]
 
     def decision_chain_rows(self) -> list[dict[str, Any]]:
@@ -4968,7 +5096,8 @@ class MainWindow(QMainWindow):
         self.equity_label.setText(money(summary["equity"]))
         self.profit_label.setText(f"{money(gain)} / {pct(gain_pct)}")
         self.profit_label.setStyleSheet("color: #d21f1f;" if gain > 0 else "color: #14934a;" if gain < 0 else "")
-        self.date_label.setText(today_str() + "（T+1：今日买入不可卖出）")
+        self.date_label.setText(today_str())
+        self.date_label.setToolTip("A股今日买入须下一交易日卖出；港股可当日买卖。")
 
     def render_overview(self) -> None:
         if not hasattr(self, "overview_equity"):
@@ -5140,7 +5269,7 @@ class MainWindow(QMainWindow):
                 str(order.get("qty") or ""),
                 f"{limit_price:.3f}",
                 f"{last_price:.3f}" if last_price else "-",
-                "等待成交",
+                str(order.get("wait_reason") or "等待成交"),
                 trigger,
             ]
             order_id = str(order.get("id") or "")
@@ -5341,6 +5470,7 @@ class MainWindow(QMainWindow):
     def render_strategy_workspace(self) -> None:
         if not hasattr(self, "strategy_catalog_table"):
             return
+        self.local_strategy_panel.refresh_rows()
         catalog = self.strategy_catalog_rows()
         self.strategy_catalog_table.setRowCount(len(catalog))
         for row, item in enumerate(catalog):
@@ -5542,10 +5672,10 @@ class MainWindow(QMainWindow):
               "输入里包含真实行情、全量历史日K技术画像、当日分时/VWAP画像、持仓、委托、风控配置，以及本地策略上下文 strategy_context。"
               "strategy_context 只是确定性策略/风控信号，供你参考，不是最终结论；最终多智能体分析必须由你完成。"
               "首次接入时必须先读取 strategy_context.strategy_pack.enabled_definitions，理解用户启用的策略定义、作用和硬规则。"
-              "随后读取 strategy_context.market_gate 与 strategy_context.canslim_radar；市场闸门红灯时不要提出新开多仓，CAN SLIM 基本面缺项不得编造。"
+              "仅在相应策略启用时参考 market_gate 与 canslim_radar；市场颜色不否决开仓，CAN SLIM 基本面缺项不得编造。"
               "完整历史日K在 codex_bridge.kline_history_file，格式为 symbols[code].klines[]；不要误以为只有当日走势。"
               "不要只根据今日涨跌幅下结论；技术面至少参考 MA5/10/20/60/120/250、量能、支撑压力、MACD、KDJ、VWAP/均价线、近5/15/30分钟变化、尾盘信号和近期交易质量。"
-              "科创板买入最低200股且100股递增；卖出时如果可卖余额不足200股，只能一次性卖出剩余余额。"
+              "科创板买入最低200股且1股递增；卖出时如果可卖余额不足200股，只能一次性卖出剩余余额。"
             f"本次启用的 agent pipeline 是：{agent_spec}。"
             "请严格按照启用的 agent 输出 agents 数组，除非某角色输入不足，否则不要省略。"
             "请严格输出一个 JSON 对象，不要 Markdown，不要解释性前后缀。"
@@ -5562,7 +5692,7 @@ class MainWindow(QMainWindow):
             "\"limit_price\":12.8,\"reason\":\"简短理由\"}],"
             "\"notes\":[\"补充说明\"]}。"
             "commands 只是候选 JSON 指令，不要为了凑数强行下单；没有把握时使用 hold。"
-            "必须遵守 T+1、可用现金、冻结资金、每手数量、风控限制和只允许快照内股票代码。"
+            "必须遵守 T+1、可用现金、冻结资金、申报数量和有效行情；同股活动委托最多3条。允许ST、持仓加买和手工重复提交；股数明确，不套仓位比例上限或暗中缩量。只允许快照内股票代码。"
             "这是模拟交易练习，不构成投资建议。"
         )
 
@@ -6045,7 +6175,7 @@ class MainWindow(QMainWindow):
             if action in ("amend", "modify", "update", "replace", "change_price"):
                 qty_value = command.get("qty")
                 price_value = command.get("limit_price")
-                qty = int(qty_value) if qty_value not in (None, "") else int(order.get("qty") or 0)
+                qty = parse_order_quantity(qty_value) if qty_value not in (None, "") else int(order.get("qty") or 0)
                 limit_price = float(price_value) if price_value not in (None, "") else float(order.get("limit_price") or 0)
                 code = str(order.get("code") or "")
                 quote = self.quote_cache.get(code)
@@ -6062,12 +6192,15 @@ class MainWindow(QMainWindow):
         quote = self.quote_cache.get(code)
         if not quote:
             return "暂无行情"
+        stale = quote_freshness_error(quote, dt.datetime.now())
+        if stale:
+            return stale
         try:
-            qty = int(command.get("qty") or 0)
+            qty = parse_order_quantity(command.get("qty"))
             limit_price = float(command.get("limit_price") or 0)
         except Exception:
             return "数量或价格无效"
-        if qty <= 0 or limit_price <= 0:
+        if qty <= 0 or not math.isfinite(limit_price) or limit_price <= 0:
             return "数量或价格无效"
         time_error = trading_time_error(code)
         if time_error:
@@ -6228,7 +6361,7 @@ class MainWindow(QMainWindow):
                     "你是 AIStockSim 的 Agent Chatroom，只讨论模拟盘，不操作真实账户。"
                     "回答要基于当前账户、行情、全量历史日K技术画像、当日分时/VWAP画像、风险审计、策略上下文和最新多智能体报告。"
                     "不要只看今日涨跌幅；需要结合均线、量能、支撑压力、MACD、KDJ、VWAP/均价线、近5/15/30分钟变化、尾盘信号和近期交易质量。"
-                    "科创板买入最低200股且100股递增；卖出时如果可卖余额不足200股，只能一次性卖出剩余余额。"
+                    "科创板买入最低200股且1股递增；卖出时如果可卖余额不足200股，只能一次性卖出剩余余额。"
                     "如果给出买卖想法，只能用自然语言说明条件和风险，不要输出可直接执行的 JSON 指令。"
                     "需要明确区分事实、推断和不确定性。"
                 ),
@@ -6359,77 +6492,17 @@ class MainWindow(QMainWindow):
         replacing_order: dict[str, Any] | None = None,
         check_pending_limit: bool = True,
     ) -> list[str]:
-        cfg = self.store.risk_config()
-        if not cfg.get("enabled", True):
+        if not check_pending_limit:
             return []
-        action_name = action.upper()
-        code = quote.code
-        errors: list[str] = []
         replace_id = str((replacing_order or {}).get("id") or "")
-        active_same_code = [
-            order
+        active_count = sum(
+            str(order.get("code") or "") == quote.code
+            and str(order.get("id") or "") != replace_id
             for order in self.store.active_pending_orders()
-            if str(order.get("code") or "") == code and str(order.get("id") or "") != replace_id
-        ]
-        max_pending = int(cfg.get("max_pending_per_code", 3))
-        if check_pending_limit and len(active_same_code) >= max_pending:
-            errors.append(f"{code} 已有 {len(active_same_code)} 条活动委托，达到同代码委托上限 {max_pending}。")
-        if action_name != "BUY":
-            return errors
-
-        if self.strategy_enabled("market_gate"):
-            gate = self.market_gate_profile()
-            positions = self.store.positions()
-            current_qty_for_gate = int((positions.get(code) or {}).get("qty") or 0)
-            if current_qty_for_gate <= 0 and gate.get("gate") == "red":
-                errors.append(f"市场环境闸门红灯：{gate.get('summary') or '当前策略禁止新开多仓'}")
-
-        if cfg.get("block_st_buy", True) and "ST" in quote.name.upper():
-            errors.append(f"{quote.name} 属于 ST 风险股，当前风控禁止买入。")
-        if cfg.get("block_chasing_high", True):
-            max_change = float(cfg.get("max_buy_change_pct", 7.0))
-            if quote.change_pct >= max_change:
-                errors.append(f"{quote.code} 当前涨幅 {quote.change_pct:.2f}%，超过追高阈值 {max_change:.1f}%。")
-        equity = self.account_equity_estimate()
-        order_value = max(0.0, float(limit_price) * int(qty))
-        if equity > 0:
-            max_single_buy = equity * float(cfg.get("max_single_buy_pct", 25.0)) / 100
-            if order_value > max_single_buy + 1e-6:
-                errors.append(
-                    f"单笔买入金额 {money(order_value, quote.currency)} 超过账户权益 {float(cfg.get('max_single_buy_pct', 25.0)):.1f}% 上限。"
-                )
-            positions = self.store.positions()
-            current_qty = int((positions.get(code) or {}).get("qty") or 0)
-            if cfg.get("loss_position_reduce_only", True) and current_qty > 0:
-                breakeven = float((positions.get(code) or {}).get("breakeven_cost") or 0)
-                if breakeven > 0:
-                    drawdown = quote.price / breakeven * 100 - 100
-                    threshold = float(cfg.get("loss_position_threshold_pct", -3.0))
-                    if drawdown <= threshold:
-                        errors.append(f"{code} 当前较摊余回本价 {drawdown:.2f}%，触发亏损持仓只减不加规则。")
-            if cfg.get("block_new_position_near_close", True) and current_qty <= 0:
-                try:
-                    now_time = dt.datetime.now().time()
-                    close_time = dt.time(16, 0) if code.startswith("hk") else dt.time(15, 0)
-                    close_dt = dt.datetime.combine(dt.date.today(), close_time)
-                    now_dt = dt.datetime.combine(dt.date.today(), now_time)
-                    minutes = int(cfg.get("near_close_minutes", 15))
-                    if dt.timedelta(0) <= close_dt - now_dt <= dt.timedelta(minutes=minutes):
-                        errors.append(f"距离收盘不足 {minutes} 分钟，当前风控禁止开新仓。")
-                except Exception:
-                    pass
-            pending_buy_value = 0.0
-            for order in self.store.active_pending_orders():
-                if str(order.get("id") or "") == replace_id:
-                    continue
-                if str(order.get("code") or "") == code and str(order.get("action") or "").upper() == "BUY":
-                    pending_buy_value += float(order.get("limit_price") or 0) * int(order.get("qty") or 0)
-            target_value = current_qty * quote.price + pending_buy_value + order_value
-            target_pct = target_value / equity * 100
-            max_position = float(cfg.get("max_position_pct", 65.0))
-            if target_pct > max_position + 1e-6:
-                errors.append(f"{code} 买入后预计仓位 {target_pct:.1f}%，超过单票最大仓位 {max_position:.1f}%。")
-        return errors
+        )
+        if active_count >= MAX_PENDING_PER_CODE:
+            return [f"{quote.code} 已有 {active_count} 条活动委托，同代码最多 {MAX_PENDING_PER_CODE} 条。"]
+        return []
 
     def _set_row(self, table: QTableWidget, row: int, values: list[str], sign: float = 0.0) -> None:
         for col, value in enumerate(values):
@@ -6500,7 +6573,13 @@ class MainWindow(QMainWindow):
             quote = self.quote_cache.get(target)
         if not quote:
             return f"{target} 暂时无法取得实时价格。"
-        count = int(qty or self.qty_spin.value())
+        stale = quote_freshness_error(quote, dt.datetime.now())
+        if stale:
+            return stale
+        try:
+            count = parse_order_quantity(qty if qty is not None else self.qty_spin.value())
+        except ValueError as exc:
+            return str(exc)
         if count <= 0:
             return "数量必须大于 0"
         if action.lower() == "buy":
@@ -6553,19 +6632,51 @@ class MainWindow(QMainWindow):
             code = str(order.get("code") or "")
             quote = self.quote_cache.get(code)
             if not quote:
+                order["wait_reason"] = "缺少报价，等待刷新"
+                changed = True
+                continue
+            stale = quote_freshness_error(quote, dt.datetime.now())
+            if stale:
+                order["wait_reason"] = stale
+                changed = True
                 continue
             order["last_price"] = round(float(quote.price), 4)
             action = str(order.get("action") or "").upper()
-            limit_price = float(order.get("limit_price") or 0)
-            triggered = quote.price <= limit_price if action == "BUY" else quote.price >= limit_price
-            if not triggered:
+            try:
+                qty = parse_order_quantity(order.get("qty"))
+                limit_price = float(order.get("limit_price") or 0)
+            except (TypeError, ValueError, OverflowError):
+                order.update(status="FAILED", failed_at=now_str(), error="委托数量或价格无效")
                 changed = True
                 continue
-            if trading_time_error(code):
+            if action not in ("BUY", "SELL") or not math.isfinite(limit_price) or limit_price <= 0:
+                order.update(status="FAILED", failed_at=now_str(), error="委托方向或价格无效")
+                changed = True
+                continue
+            local_id = str(order.get("local_signal_id") or "")
+            protective = action == "SELL" and (local_id.startswith("stop:") or ":stop:" in local_id)
+            if local_id and not protective:
+                try:
+                    confirmed = dt.date.fromisoformat(str(order.get("signal_confirmed_at") or order.get("signal_date") or ""))
+                except (TypeError, ValueError):
+                    order["wait_reason"] = "本地信号缺少可核验的确认日期，等待修正"
+                    changed = True
+                    continue
+                if confirmed >= dt.date.today():
+                    order["wait_reason"] = "日线信号须在确认日之后成交；委托持续有效"
+                    changed = True
+                    continue
+            triggered = quote.price <= limit_price if action == "BUY" else quote.price >= limit_price
+            if not triggered:
+                order["wait_reason"] = "委托价格尚未触发"
+                changed = True
+                continue
+            time_error = trading_time_error(code)
+            if time_error:
+                order["wait_reason"] = time_error
                 changed = True
                 continue
             try:
-                qty = int(order.get("qty") or 0)
                 risk_errors = self.risk_violations_for_order(action, quote, qty, quote.price, order, check_pending_limit=False)
                 if risk_errors:
                     order["status"] = "FAILED"
@@ -6575,10 +6686,14 @@ class MainWindow(QMainWindow):
                     continue
                 reason = f"限价委托触发，委托价 {limit_price:.3f}"
                 if action == "BUY":
-                    self.store.buy(quote, qty, str(order.get("operator") or "用户"), reason)
+                    self.store.buy(quote, qty, str(order.get("operator") or "用户"), reason,
+                                   pending_order_id=str(order.get("id") or ""))
                 else:
-                    self.store.sell(quote, qty, str(order.get("operator") or "用户"), reason)
+                    self.store.sell(quote, qty, str(order.get("operator") or "用户"), reason,
+                                    local_only=bool(order.get("local_signal_id")),
+                                    pending_order_id=str(order.get("id") or ""))
                 order["status"] = "FILLED"
+                order.pop("wait_reason", None)
                 order["filled_at"] = now_str()
                 order["filled_price"] = round(float(quote.price), 4)
                 executed += 1
@@ -6597,6 +6712,9 @@ class MainWindow(QMainWindow):
                             "orders": [order],
                         }
                     )
+            except ValueError as exc:
+                order["wait_reason"] = str(exc)
+                changed = True
             except Exception as exc:
                 order["status"] = "FAILED"
                 order["failed_at"] = now_str()
@@ -6619,7 +6737,13 @@ class MainWindow(QMainWindow):
             quote = self.quote_cache.get(target)
         if not quote:
             return f"{target} 暂时无法取得实时价格。"
-        count = int(qty or self.qty_spin.value())
+        stale = quote_freshness_error(quote, dt.datetime.now())
+        if stale:
+            return stale
+        try:
+            count = parse_order_quantity(qty if qty is not None else self.qty_spin.value())
+        except ValueError as exc:
+            return str(exc)
         try:
             risk_errors = self.risk_violations_for_order(action, quote, count, quote.price, check_pending_limit=False)
             if risk_errors:
@@ -6680,7 +6804,7 @@ class MainWindow(QMainWindow):
                 "summary": latest_report.get("summary"),
                 "commands": latest_report.get("commands") or [],
             } if latest_report else None,
-            "rules": "模拟交易；用户和 AI/Codex 下单均为限价委托，buy/sell 指令必须包含 limit_price；买入在实时价小于等于委托价时成交，卖出在实时价大于等于委托价时成交；A股/港股均按 T+1，今日买入不可卖出；买入数量按市场每手/最低申报规则校验；科创板买入最低200股且100股递增，卖出时可卖余额不足200股应一次性卖出；暂不计算手续费、印花税、汇率。",
+            "rules": "模拟交易；用户和 AI/Codex 下单均为限价委托，buy/sell 指令必须包含 limit_price；买入在实时价小于等于委托价时成交，卖出在实时价大于等于委托价时成交；A股按 T+1，今日买入不可卖出；港股支持当日买卖；买入数量按市场每手/最低申报规则校验；科创板买入最低200股且1股递增，卖出时可卖余额不足200股应一次性卖出；暂不计算手续费、印花税、汇率。",
             "codex_order_schema": {
                 "new_order": {"action": "buy|sell", "code": "sh600000", "qty": 100, "limit_price": 12.8, "reason": "short reason"},
                 "cancel_order": {"action": "cancel", "order_id": "preferred when available", "code": "sh600000", "side": "sell", "reason": "short reason"},
@@ -6700,12 +6824,12 @@ class MainWindow(QMainWindow):
             "每个元素格式为 {\"action\":\"buy|sell|hold\", \"code\":\"sh600000\", \"qty\":100, \"limit_price\":10.5, \"reason\":\"简短理由\"}。"
             "buy/sell 必须提供 limit_price；hold 可以省略 qty 和 limit_price。"
             "买入委托在实时价小于等于 limit_price 时成交，卖出委托在实时价大于等于 limit_price 时成交。"
-            "首次接入必须先读 strategy_context.strategy_pack.enabled_definitions、market_gate 和 canslim_radar，理解用户启用的策略组合。"
-            "市场闸门红灯时不要提出新开多仓；CAN SLIM 缺少基本面数据时必须标记缺项，不能编造 EPS/营收/ROE。"
+            "首次接入先读 strategy_context.strategy_pack.enabled_definitions，仅参考用户启用的策略；禁用策略不得参与下单判断。"
+            "同股活动委托最多3条；允许ST、持仓加买和手工重复提交，不设置仓位比例上限或自动缩量。CAN SLIM 缺少基本面数据时必须标记缺项，不能编造 EPS/营收/ROE。"
             "完整历史日K在 codex_bridge.kline_history_file，格式为 symbols[code].klines[]；不要误以为只有当日走势。"
             "不要只根据今日涨跌幅下单；必须参考快照里的 daily_technical_profiles、intraday_profiles、strategy_context.market_rows[].technical、strategy_context.market_rows[].intraday、均线、量能、支撑压力、MACD、KDJ、VWAP/均价线、近5/15/30分钟变化和风控。"
             "如果历史K或分时样本不足，要明确说样本不足，不能编造。"
-            "科创板买入最低200股且100股递增；卖出时如果可卖余额不足200股，只能一次性卖出剩余余额。"
+            "科创板买入最低200股且1股递增；卖出时如果可卖余额不足200股，只能一次性卖出剩余余额。"
             "只允许使用快照里的股票代码；这是虚拟交易，不构成投资建议。"
         )
         payload = {
@@ -6960,7 +7084,7 @@ class MainWindow(QMainWindow):
                         quote = self.quote_cache.get(matched_code)
                     qty_value = order.get("qty")
                     price_value = order.get("limit_price")
-                    qty = int(qty_value) if qty_value not in (None, "") else None
+                    qty = parse_order_quantity(qty_value) if qty_value not in (None, "") else None
                     limit_price = float(price_value) if price_value not in (None, "") else None
                     if qty is None and limit_price is None:
                         raise ValueError("amend/modify 至少需要 qty 或 limit_price。")
@@ -6995,14 +7119,14 @@ class MainWindow(QMainWindow):
                 continue
 
             try:
-                qty = int(order.get("qty") or 0)
+                qty = parse_order_quantity(order.get("qty"))
             except Exception:
                 qty = 0
             try:
                 limit_price = float(order.get("limit_price"))
             except Exception:
                 limit_price = 0.0
-            if not code or qty <= 0 or action not in ("buy", "sell") or limit_price <= 0:
+            if not code or qty <= 0 or action not in ("buy", "sell") or not math.isfinite(limit_price) or limit_price <= 0:
                 errors.append(f"跳过无效指令：{order}")
                 continue
             quote = self.quote_cache.get(code)
@@ -7011,6 +7135,10 @@ class MainWindow(QMainWindow):
                 quote = self.quote_cache.get(code)
             if not quote:
                 errors.append(f"{code}: 暂时无法取得实时价格。")
+                continue
+            stale = quote_freshness_error(quote, dt.datetime.now())
+            if stale:
+                errors.append(f"{code}: {stale}")
                 continue
             if action == "buy":
                 try:
@@ -7065,13 +7193,20 @@ class MainWindow(QMainWindow):
 
 def main() -> int:
     app = QApplication(sys.argv)
+    configure_light_theme(app)
+    if "--smoke-test" in sys.argv:
+        from scripts.smoke_ui import run
+        return run(app, sys.modules[__name__])
     icon_path = resource_path(ICON_FILE)
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
     win = MainWindow()
-    win.show()
+    win.show_restored_window()
     return app.exec()
 
 
 if __name__ == "__main__":
+    # The panel imports application helpers lazily. Reuse this entry module so
+    # frozen/script launches do not create a second set of runtime paths.
+    sys.modules.setdefault("StockTradingSim", sys.modules[__name__])
     raise SystemExit(main())

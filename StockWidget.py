@@ -2,6 +2,7 @@
 # python3 -m PyInstaller -F -w .\StockWidget.py --name StockWidget --icon .\StockWidget.ico --add-data ".\StockWidget.ico;."
 import sys, os, json, ctypes, re, requests, keyboard, winreg
 from functools import partial
+from app_theme import configure_light_theme
 
 from PySide6.QtCore import (
     Qt, QEvent, QTimer, QRect, QPoint, QAbstractTableModel, QModelIndex, Signal, QSize
@@ -31,7 +32,8 @@ def set_windows_app_user_model_id(appid: str):
         pass
 
 # ----- 配置存档 -----
-CONFIG_DIR = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~"), APP_NAME)
+CONFIG_DIR = os.path.abspath(os.path.join(os.getenv("AISTOCKSIM_DATA_DIR"), APP_NAME) if os.getenv("AISTOCKSIM_DATA_DIR")
+                             else os.path.join(os.getenv("APPDATA") or os.path.expanduser("~"), APP_NAME))
 CONFIG_FILE = os.path.join(CONFIG_DIR, "SW_config.json")
 
 def load_config():
@@ -52,7 +54,6 @@ def save_config(cfg: dict):
 # ----- 颜色配置 -----
 UP_COLOR = QColor("#dd2100")
 DOWN_COLOR = QColor("#019933")
-NEUTRAL_COLOR = QColor("#494949")
 
 # ===================== 表格 =====================
 class SimpleTableModel(QAbstractTableModel):
@@ -116,7 +117,7 @@ class SimpleTableModel(QAbstractTableModel):
                 return UP_COLOR
             if sign < 0:
                 return DOWN_COLOR
-            return NEUTRAL_COLOR
+            return self.fg_color
 
         return None
 
@@ -185,7 +186,7 @@ class KLineDelegate(QStyledItemDelegate):
         x = krect.center().x()
 
         # 昨收虚线
-        dash_col = QColor(NEUTRAL_COLOR if self.default_color else self.fg)
+        dash_col = QColor(self.fg)
         dash_col.setAlpha(180)
         painter.setPen(QPen(dash_col, 1, Qt.DashLine))
         painter.drawLine(x - body_w, y_p, x + body_w, y_p)
@@ -197,7 +198,7 @@ class KLineDelegate(QStyledItemDelegate):
             elif c<o:
                 kcolor = DOWN_COLOR
             else:
-                kcolor = NEUTRAL_COLOR
+                kcolor = self.fg
 
         top, bot = min(y_o, y_c), max(y_o, y_c)
         body_h = max(2, bot - top)
@@ -466,7 +467,7 @@ class FloatLabel(QWidget):
                 background: transparent;
                 border: {f"1px solid {line_col}" if self.grid_visible else "none"};
                 border-radius: 3px;
-                {"" if self.default_color else f"color: {self.fg.name()};"}
+                color: {self.fg.name()};
                 outline: none;
             }}
             QTableView::item {{
@@ -481,7 +482,7 @@ class FloatLabel(QWidget):
                 border: none;
                 border-bottom: 1px solid {line_col};
                 font-weight: 600;
-                {"" if self.default_color else f"color: {self.fg.name()};"}
+                color: {self.fg.name()};
                 padding: 2px 4px;
             }}
         """)
@@ -1866,6 +1867,7 @@ class SettingsDialog(QDialog):
 class App(QApplication):
     def __init__(self, argv):
         super().__init__(argv)
+        configure_light_theme(self)
         self.setQuitOnLastWindowClosed(False)
         icon_path = resource_path(APP_ICON_FILE)
         # load saved icon choice from config
